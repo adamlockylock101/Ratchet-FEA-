@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Test / tooling
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Run outputs (regenerate with scripts/run_tier2_fe.py)
+results/
+*.msh
+*.vtk
+*.vtu
+*.xdmf
+*.h5
