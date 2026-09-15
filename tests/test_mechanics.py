@@ -24,6 +24,7 @@ from ratchet_fea.mechanics import (
     plane_stress_moduli,
     principal_stresses,
     recover_polymer_stress,
+    relaxed_stress_free_moisture,
     solve,
     stress_concentration_factors,
     von_mises,
@@ -155,6 +156,34 @@ class TestPlyStressRecovery:
         q11, q12, q66 = plane_stress_moduli(1400.0, 0.42)
         _, _, sxy = recover_polymer_stress(0.0, 0.0, 2e-3, q11, q12, q66, 0.02)
         assert sxy == pytest.approx(2.0 * q66 * 2e-3)
+
+
+class TestRelaxedStressFreeState:
+    """The assumption that decides whether drying can produce tension at all."""
+
+    def test_no_relaxation_keeps_the_as_moulded_reference(self):
+        assert relaxed_stress_free_moisture(0.025, 0.0) == 0.0
+
+    def test_full_relaxation_moves_it_to_the_conditioned_state(self):
+        assert relaxed_stress_free_moisture(0.025, 1.0) == pytest.approx(0.025)
+
+    def test_partial_relaxation_interpolates(self):
+        assert relaxed_stress_free_moisture(0.025, 0.4) == pytest.approx(0.010)
+
+    def test_a_dry_start_has_nothing_to_relax_to(self):
+        """Absorption from as-moulded is unaffected by the relaxation knob."""
+        for fraction in (0.0, 0.5, 1.0):
+            assert relaxed_stress_free_moisture(0.0, fraction) == 0.0
+
+    def test_fraction_is_bounded(self):
+        with pytest.raises(ValueError, match=r"must lie in \[0, 1\]"):
+            relaxed_stress_free_moisture(0.025, 1.5)
+        with pytest.raises(ValueError, match=r"must lie in \[0, 1\]"):
+            relaxed_stress_free_moisture(0.025, -0.1)
+
+    def test_negative_conditioned_moisture_is_rejected(self):
+        with pytest.raises(ValueError, match="cannot be negative"):
+            relaxed_stress_free_moisture(-0.01, 1.0)
 
 
 class TestMechanicsModel:
@@ -326,6 +355,104 @@ class TestPatchTests:
         )
         result = solve(plain_strip, model, concentration=None)
         assert np.max(np.abs(result.sxx)) < 1e-9
+
+    def test_drying_below_the_reference_puts_the_strap_into_tension(
+        self, plain_strip
+    ):
+        """The desorption mechanism, end to end.
+
+        Same dried-out moisture field, two stress-free references. With the
+        as-moulded reference the strap is merely unloaded; with the conditioned
+        reference the same drying is constrained SHRINKAGE against the band and
+        the sign reverses.
+        """
+        g = plain_strip.geometry
+        conditioned = 0.025
+        base = MechanicsModel.from_materials(
+            g, moisture_dependent_modulus=False
+        ).without_tension()
+        dried = np.zeros(plain_strip.n_vertices)
+
+        elastic = solve(plain_strip, replace(base, stress_free_moisture=0.0), dried)
+        relaxed = solve(
+            plain_strip, replace(base, stress_free_moisture=conditioned), dried
+        )
+
+        assert np.mean(elastic.sxx) == pytest.approx(0.0, abs=1e-6)
+        assert np.mean(relaxed.sxx) > 5.0, "constrained shrinkage must be tensile"
+
+    def test_shrinkage_tension_mirrors_swelling_compression(self, plain_strip):
+        """Equal and opposite for an equal moisture change about the reference.
+
+        Holding the modulus fixed isolates the sign reversal from the fact that
+        a dry polymer is also a stiffer one.
+        """
+        g = plain_strip.geometry
+        reference = 0.03
+        delta = 0.02
+        base = replace(
+            MechanicsModel.from_materials(
+                g, moisture_dependent_modulus=False
+            ).without_tension(),
+            stress_free_moisture=reference,
+        )
+        wetter = solve(
+            plain_strip, base, np.full(plain_strip.n_vertices, reference + delta)
+        )
+        drier = solve(
+            plain_strip, base, np.full(plain_strip.n_vertices, reference - delta)
+        )
+        assert np.mean(wetter.sxx) < 0 < np.mean(drier.sxx)
+        assert np.mean(drier.sxx) == pytest.approx(-np.mean(wetter.sxx), rel=1e-6)
+
+    def test_a_dried_strap_is_stiffer_so_shrinkage_tension_is_amplified(
+        self, plain_strip
+    ):
+        """With the real moisture-dependent modulus the mirror is not exact.
+
+        Drying stiffens PA66 by 2-3x, so the same moisture change produces MORE
+        stress on the way down than on the way up. Ignoring that would
+        understate the tensile half of a moisture cycle.
+        """
+        g = plain_strip.geometry
+        reference = 0.03
+        delta = 0.02
+        base = replace(
+            MechanicsModel.from_materials(
+                g, moisture_dependent_modulus=True
+            ).without_tension(),
+            stress_free_moisture=reference,
+        )
+        wetter = abs(
+            np.mean(
+                solve(
+                    plain_strip, base, np.full(plain_strip.n_vertices, reference + delta)
+                ).sxx
+            )
+        )
+        drier = abs(
+            np.mean(
+                solve(
+                    plain_strip, base, np.full(plain_strip.n_vertices, reference - delta)
+                ).sxx
+            )
+        )
+        assert drier > wetter
+
+    def test_no_band_means_no_shrinkage_tension_either(self, plain_strip):
+        """Symmetric with the swelling case: nothing to shrink against."""
+        g = plain_strip.geometry
+        base = (
+            MechanicsModel.from_materials(g, moisture_dependent_modulus=False)
+            .without_tension()
+            .without_band()
+        )
+        result = solve(
+            plain_strip,
+            replace(base, stress_free_moisture=0.025),
+            np.zeros(plain_strip.n_vertices),
+        )
+        assert np.max(np.abs(result.sxx)) < 1e-6
 
     def test_moisture_softening_reduces_the_swelling_stress(self, plain_strip):
         """The water that swells the polymer also softens it; both must count."""

@@ -18,6 +18,8 @@ from ratchet_fea.mechanics import MechanicsModel, stress_concentration_factors
 from ratchet_fea.postprocess import (
     SECONDS_PER_DAY,
     FreeEdgeVerdict,
+    MoistureCycleAssessment,
+    TensileAssessment,
     Tier1Comparison,
     bulk_element_mask,
     compare_with_tier1,
@@ -26,6 +28,10 @@ from ratchet_fea.postprocess import (
     plot_hole_stress_history,
     plot_stress_vs_uptake,
     plot_tier1_comparison,
+    moisture_cycle_assessment,
+    peak_tensile_assessment,
+    plot_moisture_cycle,
+    relaxation_bracket,
     stress_history,
     write_summary,
 )
@@ -379,3 +385,329 @@ class TestOutputs:
             "MPa",
         )
         assert path.exists() and path.stat().st_size > 1000
+
+
+
+class TestTensileAssessmentLogic:
+    """Unit-level, with constructed values."""
+
+    @staticmethod
+    def _assessment(**overrides) -> TensileAssessment:
+        base = dict(
+            case="desorption",
+            peak_stress=32.0,
+            peak_time=0.05 * SECONDS_PER_DAY,
+            peak_uptake=0.08,
+            moisture_at_peak=0.0,
+            yield_low=75.0,
+            yield_nominal=82.5,
+            yield_high=90.0,
+            equilibrium_stress=29.7,
+            stress_free_moisture=0.025,
+        )
+        base.update(overrides)
+        return TensileAssessment(**base)
+
+    def test_utilisations(self):
+        a = self._assessment()
+        assert a.utilisation_low == pytest.approx(32.0 / 75.0)
+        assert a.utilisation_nominal == pytest.approx(32.0 / 82.5)
+        assert a.utilisation_high == pytest.approx(32.0 / 90.0)
+
+    def test_the_weakest_yield_gives_the_highest_utilisation(self):
+        """Easy to print backwards; utilisation_range fixes the order."""
+        a = self._assessment()
+        assert a.utilisation_low > a.utilisation_high
+        best, worst = a.utilisation_range
+        assert best < worst
+        assert worst == pytest.approx(a.utilisation_low)
+
+    def test_reaches_yield_uses_the_weakest_corner(self):
+        assert not self._assessment(peak_stress=70.0).reaches_yield
+        assert self._assessment(peak_stress=80.0).reaches_yield
+
+    def test_gradient_contribution_is_the_transient_excess(self):
+        a = self._assessment(peak_stress=32.0, equilibrium_stress=29.7)
+        assert a.gradient_contribution == pytest.approx(2.3)
+
+    def test_gradient_contribution_is_undefined_when_the_peak_is_the_start(self):
+        """Otherwise a compressive case reports a huge fictitious 'gradient'."""
+        a = self._assessment(
+            peak_stress=1.4, equilibrium_stress=-30.0, peak_is_initial_state=True
+        )
+        assert a.gradient_contribution is None
+        assert "STARTING state" in a.summary()
+
+    def test_gradient_contribution_is_undefined_against_compressive_equilibrium(self):
+        a = self._assessment(peak_stress=5.0, equilibrium_stress=-10.0)
+        assert a.gradient_contribution is None
+
+    def test_a_case_peaking_at_t_zero_does_not_develop_tension(self):
+        """A small positive value from the mechanical load is not a tensile case."""
+        a = self._assessment(peak_stress=1.4, peak_is_initial_state=True)
+        assert a.is_tensile
+        assert not a.develops_tension
+        assert "does not drive the hole edge into tension" in a.summary()
+
+    def test_a_case_peaking_mid_transient_does_develop_tension(self):
+        a = self._assessment(peak_stress=32.0, peak_is_initial_state=False)
+        assert a.develops_tension
+
+    def test_a_compressive_case_is_reported_as_not_tensile(self):
+        a = self._assessment(peak_stress=-12.0)
+        assert not a.is_tensile
+        assert not a.develops_tension
+        assert "does not drive the hole edge into tension" in a.summary()
+
+    def test_summary_flags_reaching_yield(self):
+        assert "REACHES YIELD" in self._assessment(peak_stress=80.0).summary()
+
+    def test_summary_reports_the_whole_bracket(self):
+        text = self._assessment().summary()
+        for expected in ("low", "nominal", "high", "stress-free moisture"):
+            assert expected in text
+
+
+class TestMoistureCycleLogic:
+    @staticmethod
+    def _cycle(**overrides) -> MoistureCycleAssessment:
+        base = dict(
+            peak_tension=31.6,
+            peak_compression=-31.1,
+            uts_low=75.0,
+            uts_nominal=85.0,
+            uts_high=95.0,
+            bulk_half_time=8.7 * SECONDS_PER_DAY,
+        )
+        base.update(overrides)
+        return MoistureCycleAssessment(**base)
+
+    def test_range_amplitude_and_mean(self):
+        c = self._cycle()
+        assert c.stress_range == pytest.approx(62.7)
+        assert c.stress_amplitude == pytest.approx(31.35)
+        assert c.mean_stress == pytest.approx(0.25)
+
+    def test_r_ratio_is_near_fully_reversed(self):
+        assert self._cycle().r_ratio == pytest.approx(-31.1 / 31.6)
+
+    def test_a_purely_tensile_cycle_has_r_zero(self):
+        assert self._cycle(peak_compression=0.0).r_ratio == pytest.approx(0.0)
+
+    def test_amplitude_over_uts_uses_the_named_corner(self):
+        c = self._cycle()
+        assert c.amplitude_over_uts("low") > c.amplitude_over_uts("high")
+        assert c.amplitude_over_uts("low") == pytest.approx(31.35 / 75.0)
+
+    def test_significance_needs_both_amplitude_and_a_negative_r(self):
+        assert self._cycle().is_significant
+        # Same amplitude but entirely in tension: not a reversed cycle.
+        assert not self._cycle(
+            peak_tension=62.7, peak_compression=0.0
+        ).is_significant
+        # Reversed but small.
+        assert not self._cycle(peak_tension=5.0, peak_compression=-5.0).is_significant
+
+    def test_commentary_always_covers_the_caveats(self):
+        for cycle in (self._cycle(), self._cycle(peak_tension=5.0, peak_compression=-5.0)):
+            text = " ".join(cycle.commentary())
+            assert "WHY THIS IS NOT A FATIGUE ANALYSIS" in text
+            assert "TWO TIME SCALES" in text
+            assert "Tier 3" in text
+
+    def test_commentary_changes_with_significance(self):
+        assert "WORTH CHASING" in " ".join(self._cycle().commentary())
+        assert "WORTH CHASING" not in " ".join(
+            self._cycle(peak_tension=5.0, peak_compression=-5.0).commentary()
+        )
+
+    def test_summary_reports_the_cycle(self):
+        text = self._cycle().summary()
+        for expected in ("stress range", "amplitude", "R = sigma_min"):
+            assert expected in text
+
+
+@pytest.mark.requires_gmsh
+class TestDesorptionCase:
+    """End to end: conditioned strap, dried out, against the yield bracket."""
+
+    @pytest.fixture(scope="class")
+    def dried(self, small_strip, small_geometry):
+        from ratchet_fea.mechanics import relaxed_stress_free_moisture
+
+        model = DiffusionModel.between(
+            small_geometry, MoistureState.RH50, MoistureState.DRY
+        )
+        times = log_time_grid(20 * model.characteristic_time(), n_steps=8)
+        diffusion = solve_diffusion(small_strip, model, times)
+        mech = MechanicsModel.from_materials(
+            small_geometry,
+            stress_free_moisture=relaxed_stress_free_moisture(model.c_initial, 1.0),
+        )
+        return stress_history(small_strip, diffusion, mech, every=2)
+
+    def test_the_hole_edge_goes_into_tension(self, dried):
+        """The headline: shrinkage against the band reverses the sign."""
+        assessment = peak_tensile_assessment(dried, case="desorption")
+        assert assessment.develops_tension
+        assert assessment.peak_stress > 10.0
+
+    def test_the_bulk_ends_in_tension_too(self, dried):
+        """Not just a hole-edge effect -- the whole reinforced section is pulled."""
+        assert dried.bulk_sxx[-1] > 0
+
+    def test_moisture_runs_downhill(self, dried):
+        assert dried.diffusion.concentration[-1].mean() < dried.diffusion.concentration[0].mean()
+
+    def test_the_transient_peak_is_at_or_above_equilibrium(self, dried):
+        """A drying hole wall shrinks against a still-wet interior."""
+        a = peak_tensile_assessment(dried)
+        assert a.develops_tension
+        assert a.gradient_contribution is not None
+        assert a.gradient_contribution >= -1e-9
+        assert a.peak_time <= dried.times[-1]
+
+    def test_yield_bracket_is_taken_at_the_dried_state(self, dried):
+        """A dried strap is stronger; using the wet yield would overstate risk."""
+        from ratchet_fea.materials import pa66_at_moisture
+
+        a = peak_tensile_assessment(dried)
+        assert a.yield_low > pa66_at_moisture(0.025, "low")[2]
+        assert a.yield_low < a.yield_nominal < a.yield_high
+
+    def test_relaxation_bracket_spans_unloading_to_full_tension(
+        self, small_strip, dried
+    ):
+        bracket = relaxation_bracket(
+            small_strip, dried, conditioned_moisture=0.025, fractions=(0.0, 0.5, 1.0)
+        )
+        peaks = [bracket[f]["peak_tensile"] for f in (0.0, 0.5, 1.0)]
+        assert peaks[0] < peaks[1] < peaks[2]
+        assert bracket[0.0]["stress_free_moisture"] == 0.0
+        assert bracket[1.0]["stress_free_moisture"] == pytest.approx(0.025)
+
+    def test_without_relaxation_drying_barely_produces_tension(
+        self, small_strip, dried
+    ):
+        """The purely elastic reading: drying only unloads the compression."""
+        bracket = relaxation_bracket(
+            small_strip, dried, conditioned_moisture=0.025, fractions=(0.0,)
+        )
+        assert bracket[0.0]["peak_tensile"] < 5.0
+
+
+@pytest.mark.requires_gmsh
+class TestCycleEndToEnd:
+    @pytest.fixture(scope="class")
+    def both(self, small_strip, small_geometry):
+        from ratchet_fea.mechanics import relaxed_stress_free_moisture
+
+        out = {}
+        for name, start, end, relaxation in (
+            ("absorption", MoistureState.DRY, MoistureState.IMMERSED, 0.0),
+            ("desorption", MoistureState.RH50, MoistureState.DRY, 1.0),
+        ):
+            model = DiffusionModel.between(small_geometry, start, end)
+            times = log_time_grid(20 * model.characteristic_time(), n_steps=6)
+            diffusion = solve_diffusion(small_strip, model, times)
+            mech = MechanicsModel.from_materials(
+                small_geometry,
+                stress_free_moisture=relaxed_stress_free_moisture(
+                    model.c_initial, relaxation
+                ),
+            )
+            out[name] = stress_history(small_strip, diffusion, mech, every=2)
+        return out
+
+    def test_the_two_cases_straddle_zero(self, both):
+        """Wetting compresses, drying pulls -- that is what makes it a cycle."""
+        assert np.min(both["absorption"].peak_compressive_envelope()) < 0
+        assert np.max(both["desorption"].peak_tensile_envelope()) > 0
+
+    def test_cycle_assessment_combines_them(self, both):
+        cycle = moisture_cycle_assessment(both["absorption"], both["desorption"])
+        assert cycle.peak_tension > 0 > cycle.peak_compression
+        assert cycle.stress_range == pytest.approx(
+            cycle.peak_tension - cycle.peak_compression
+        )
+        assert -2.0 < cycle.r_ratio < 0.0
+
+    def test_the_cycle_is_a_meaningful_fraction_of_strength(self, both):
+        cycle = moisture_cycle_assessment(both["absorption"], both["desorption"])
+        assert 0.05 < cycle.amplitude_over_uts("nominal") < 1.5
+
+    def test_uts_is_taken_where_the_tensile_peak_is(self, both):
+        """Tension peaks dry, and dry PA66 is the strong state."""
+        from ratchet_fea.materials import pa66_at_moisture
+
+        cycle = moisture_cycle_assessment(both["absorption"], both["desorption"])
+        assert cycle.uts_low > pa66_at_moisture(0.085, "low")[3]
+
+    def test_cycle_plot_is_written(self, both, tmp_path):
+        cycle = moisture_cycle_assessment(both["absorption"], both["desorption"])
+        path = plot_moisture_cycle(
+            both["absorption"], both["desorption"], cycle, tmp_path / "cycle.png"
+        )
+        assert path.exists() and path.stat().st_size > 1000
+
+    def test_summary_json_carries_the_new_sections(self, both, small_strip, tmp_path):
+        history = both["desorption"]
+        kt = stress_concentration_factors(small_strip)
+        tier1 = screen(geometry=history.geometry, corners=("nominal",))
+        comparison = compare_with_tier1(history, tier1, small_strip, kt)
+        cycle = moisture_cycle_assessment(both["absorption"], both["desorption"])
+        tensile = peak_tensile_assessment(history, case="desorption")
+
+        path = write_summary(
+            history,
+            comparison,
+            free_edge_validity(small_strip),
+            tmp_path / "s.json",
+            tensile=tensile,
+            cycle=cycle,
+        )
+        data = json.loads(path.read_text())
+        assert data["peak_tensile"]["stress_MPa"] == pytest.approx(tensile.peak_stress)
+        assert data["peak_tensile"]["stress_free_moisture"] == pytest.approx(0.025)
+        assert data["moisture_cycle"]["r_ratio"] == pytest.approx(cycle.r_ratio)
+        assert isinstance(data["moisture_cycle"]["is_significant"], bool)
+
+    def test_summary_json_omits_the_sections_when_not_supplied(
+        self, both, small_strip, tmp_path
+    ):
+        history = both["absorption"]
+        kt = stress_concentration_factors(small_strip)
+        tier1 = screen(geometry=history.geometry, corners=("nominal",))
+        path = write_summary(
+            history,
+            compare_with_tier1(history, tier1, small_strip, kt),
+            free_edge_validity(small_strip),
+            tmp_path / "s.json",
+        )
+        data = json.loads(path.read_text())
+        assert "peak_tensile" not in data
+        assert "moisture_cycle" not in data
+
+
+@pytest.mark.requires_gmsh
+class TestAbsorptionIsNotATensileCase:
+    """Guards the distinction the desorption case is defined against."""
+
+    def test_wetting_never_drives_the_hole_edge_into_tension(
+        self, small_strip, small_geometry
+    ):
+        model = DiffusionModel.between(
+            small_geometry, MoistureState.DRY, MoistureState.IMMERSED
+        )
+        times = log_time_grid(20 * model.characteristic_time(), n_steps=6)
+        diffusion = solve_diffusion(small_strip, model, times)
+        history = stress_history(
+            small_strip,
+            diffusion,
+            MechanicsModel.from_materials(small_geometry, stress_free_moisture=0.0),
+            every=2,
+        )
+        assessment = peak_tensile_assessment(history, case="absorption")
+        assert not assessment.develops_tension
+        assert assessment.peak_is_initial_state
+        assert history.bulk_sxx[-1] < 0

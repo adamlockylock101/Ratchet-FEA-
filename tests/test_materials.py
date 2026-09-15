@@ -122,6 +122,20 @@ class TestInterpolation:
         with pytest.raises(ValueError, match="cannot be negative"):
             pa66_at_moisture(-0.01)
 
+    def test_roundoff_below_zero_is_tolerated(self):
+        """A field dried fully out interpolates a few ulp below zero.
+
+        Rejecting that outright would make the desorption case unrunnable, so
+        round-off is clamped while a genuinely negative value still raises.
+        """
+        assert pa66_properties(np.array([-1e-18, -1e-12, 0.0]))[0] == pytest.approx(
+            PA66_DAM.youngs_modulus.nominal
+        )
+
+    def test_the_roundoff_tolerance_cannot_mask_a_real_error(self):
+        with pytest.raises(ValueError, match="cannot be negative"):
+            pa66_properties(np.array([0.0, -1e-6]))
+
     def test_vectorised_matches_scalar(self):
         c = np.array([0.0, 0.012, 0.025, 0.06, 0.085, 0.3])
         arrays = pa66_properties(c)

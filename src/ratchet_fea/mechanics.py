@@ -80,6 +80,7 @@ __all__ = [
     "MechanicsResult",
     "solve",
     "recover_polymer_stress",
+    "relaxed_stress_free_moisture",
     "principal_stresses",
     "von_mises",
     "hole_edge_stresses",
@@ -346,6 +347,56 @@ def _section_fields(model: MechanicsModel, concentration, in_band):
     n_sw = t_polymer * (q11_p + q12_p) * eps_sw
 
     return a11, a12, a66, n_sw, q11_p, q12_p, q66_p, eps_sw
+
+
+def relaxed_stress_free_moisture(
+    conditioned_moisture: float, relaxation_fraction: float = 1.0
+) -> float:
+    """Where the stress-free moisture content sits after conditioning.
+
+    This is the parameter that decides whether drying a strap out puts it into
+    TENSION or merely unloads it, so it deserves stating plainly.
+
+    A linear-elastic model has one fixed stress-free state, set at manufacture.
+    Under that reading a strap moulded dry is stress-free dry, every gram of
+    water afterwards is compressive, and drying back out can only ever return
+    the stress to zero -- never past it. Constrained shrinkage tension does not
+    exist, because there is nothing to shrink below.
+
+    Real PA66 does not behave that way. A strap sits at its service humidity
+    for weeks or months, and a polymer held at constant strain at 20-30 MPa for
+    that long relaxes: the stress bleeds away while the strain stays put, which
+    is the same thing as the stress-free state migrating toward the conditioned
+    moisture. Compressive yielding does it faster and permanently. Once it has
+    migrated, drying below the conditioned state is genuinely constrained
+    SHRINKAGE against the band, and the sign reverses.
+
+    ``relaxation_fraction`` brackets the two readings:
+
+    ``0.0``
+        No relaxation. Purely elastic, stress-free at the as-moulded state.
+        Drying only unloads. This is the conservative-looking reading, and it
+        is the one that will understate a drying-driven crack driver.
+    ``1.0``
+        Fully relaxed at the conditioned moisture, so the conditioned state
+        carries no stress and all of the subsequent drying goes into tension.
+        The bounding reading.
+
+    The truth is in between and depends on how long the strap sits wet, at what
+    temperature, and how far it yielded. Nothing in this repository can settle
+    it; see the README's verification table.
+
+    VERIFY: the fraction is a modelling knob with no measurement behind it.
+    Hole-drilling residual strain on a conditioned sample, or annealing a
+    sample and measuring the dimensional change, would pin it down.
+    """
+    if conditioned_moisture < 0.0:
+        raise ValueError("conditioned moisture content cannot be negative")
+    if not 0.0 <= relaxation_fraction <= 1.0:
+        raise ValueError(
+            f"relaxation_fraction must lie in [0, 1], got {relaxation_fraction}"
+        )
+    return conditioned_moisture * relaxation_fraction
 
 
 def recover_polymer_stress(exx, eyy, exy, q11, q12, q66, eps_sw):

@@ -52,7 +52,7 @@ import numpy as np
 from .analytical import Tier1Result, constrained_swelling_stress
 from .diffusion import DiffusionResult
 from .geometry import StrapGeometry
-from .materials import pa66_at_moisture
+from .materials import pa66_at_moisture, pa66_properties
 from .mechanics import MechanicsModel, MechanicsResult
 from .mesh import StripMesh
 
@@ -61,6 +61,11 @@ __all__ = [
     "StressHistory",
     "Tier1Comparison",
     "FreeEdgeVerdict",
+    "TensileAssessment",
+    "MoistureCycleAssessment",
+    "peak_tensile_assessment",
+    "moisture_cycle_assessment",
+    "relaxation_bracket",
     "stress_history",
     "bulk_element_mask",
     "free_edge_validity",
@@ -68,6 +73,7 @@ __all__ = [
     "plot_hole_stress_history",
     "plot_stress_vs_uptake",
     "plot_tier1_comparison",
+    "plot_moisture_cycle",
     "plot_field",
     "write_summary",
 ]
@@ -518,6 +524,390 @@ def compare_with_tier1(
 
 
 # ---------------------------------------------------------------------------
+# Peak tensile stress against the yield bracket
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TensileAssessment:
+    """Peak hole-edge TENSILE stress, and what it is up against.
+
+    Tension is the quantity that opens a crack, so it gets its own assessment
+    rather than being read off a von Mises number that cannot tell tension from
+    compression. The yield strength is evaluated at the moisture content the
+    material is actually at when the peak occurs -- which matters a great deal
+    here, because a strap that has dried out is both more highly stressed AND
+    considerably stronger than the same strap wet.
+    """
+
+    case: str
+    peak_stress: float
+    peak_time: float
+    peak_uptake: float
+    moisture_at_peak: float
+    #: Yield strength at the peak's moisture content, at each bracket corner.
+    yield_low: float
+    yield_nominal: float
+    yield_high: float
+    #: Equilibrium (end of transient) tensile stress, for comparison with the
+    #: transient peak: the difference is the moisture-gradient contribution.
+    equilibrium_stress: float
+    stress_free_moisture: float
+    #: True when the maximum occurs at t = 0, before the moisture change has
+    #: started. That means the case never develops tension at all -- the
+    #: "peak" is just the starting state.
+    peak_is_initial_state: bool = False
+
+    @property
+    def utilisation_low(self) -> float:
+        """Against the WEAKEST end of the yield bracket -- the pessimistic read."""
+        return self.peak_stress / self.yield_low
+
+    @property
+    def utilisation_nominal(self) -> float:
+        return self.peak_stress / self.yield_nominal
+
+    @property
+    def utilisation_high(self) -> float:
+        return self.peak_stress / self.yield_high
+
+    @property
+    def utilisation_range(self) -> tuple:
+        """``(best, worst)`` utilisation, ascending.
+
+        The weakest end of the yield bracket gives the HIGHEST utilisation, so
+        the low/high labels invert between the two. Ascending order avoids
+        printing a range that reads backwards.
+        """
+        return (self.utilisation_high, self.utilisation_low)
+
+    @property
+    def reaches_yield(self) -> bool:
+        """True if the peak reaches yield anywhere in the bracket."""
+        return self.peak_stress >= self.yield_low
+
+    @property
+    def is_tensile(self) -> bool:
+        return self.peak_stress > 0.0
+
+    @property
+    def develops_tension(self) -> bool:
+        """True if the moisture change itself drives the hole edge into tension.
+
+        Distinct from :attr:`is_tensile`: a case can show a small positive
+        maximum at t = 0 purely from the mechanical load and then go straight
+        into compression, which is not a tensile case in any useful sense.
+        """
+        return self.is_tensile and not self.peak_is_initial_state
+
+    @property
+    def gradient_contribution(self) -> float | None:
+        """Transient overshoot above the equilibrium tensile stress, MPa.
+
+        A drying hole wall shrinks against a still-wet interior, so it can be
+        pulled harder mid-transient than the final uniform state pulls it.
+
+        ``None`` when the comparison is meaningless -- when the peak is the
+        starting state, or when equilibrium is compressive, the difference
+        between the two is not a gradient effect, it is just the case changing
+        sign along the way.
+        """
+        if self.peak_is_initial_state or self.equilibrium_stress <= 0.0:
+            return None
+        return self.peak_stress - self.equilibrium_stress
+
+    def summary(self) -> str:
+        lines = [
+            f"PEAK TENSILE STRESS AT THE HOLE EDGE -- {self.case}",
+            "=" * 60,
+            "",
+            f"  stress-free moisture assumed   {self.stress_free_moisture:.4f}",
+            f"  peak tensile stress            {self.peak_stress:8.2f} MPa",
+            f"    at t =                       {self.peak_time / SECONDS_PER_DAY:8.2f} d "
+            f"({self.peak_uptake * 100:.0f}% through the moisture change)",
+            f"    local moisture there         {self.moisture_at_peak:8.4f} mass fraction",
+            f"  at equilibrium                 {self.equilibrium_stress:8.2f} MPa",
+        ]
+        gradient = self.gradient_contribution
+        if gradient is not None:
+            lines.append(
+                f"  transient gradient adds        {gradient:8.2f} MPa"
+            )
+        elif self.peak_is_initial_state:
+            lines.append(
+                "  (the maximum is the STARTING state, before the moisture change "
+                "begins --\n   this case never develops tension of its own)"
+            )
+        lines += [
+            "",
+            "  Against the PA66 yield bracket at that moisture content:",
+            "",
+            f"    {'corner':<10} {'yield':>8} {'utilisation':>12}",
+            "    " + "-" * 32,
+            f"    {'low':<10} {self.yield_low:8.1f} {self.utilisation_low:12.2f}",
+            f"    {'nominal':<10} {self.yield_nominal:8.1f} {self.utilisation_nominal:12.2f}",
+            f"    {'high':<10} {self.yield_high:8.1f} {self.utilisation_high:12.2f}",
+            "",
+        ]
+        if not self.develops_tension:
+            lines.append(
+                "  The moisture change does not drive the hole edge into tension in "
+                "this case.\n  With the stress-free state assumed above it moves "
+                "toward compression, or\n  merely unloads without crossing zero. "
+                "See --relaxation."
+            )
+        elif self.reaches_yield:
+            lines.append(
+                "  REACHES YIELD at the weak end of the bracket. Pin down the "
+                "grade's yield\n  strength before drawing a conclusion -- see "
+                "the verification table."
+            )
+        else:
+            lines.append(
+                f"  Stays below yield across the bracket "
+                f"(worst case {self.utilisation_low:.2f} of yield)."
+            )
+        return "\n".join(lines)
+
+
+def peak_tensile_assessment(history: StressHistory, case: str = "") -> TensileAssessment:
+    """Find the worst tensile moment at the hole edge and size it against yield."""
+    tension = history.peak_tensile_envelope()
+    peak = int(np.argmax(tension))
+
+    holes = history.representative_holes()
+    # Clamped: a field dried all the way out interpolates to a round-off-level
+    # negative, which would print as "-0.0000".
+    moisture = max(0.0, float(np.mean([h.mean_concentration[peak] for h in holes])))
+
+    yields = tuple(
+        float(pa66_properties(moisture, corner=corner)[2])
+        for corner in ("low", "nominal", "high")
+    )
+
+    return TensileAssessment(
+        case=case or history.diffusion.model.label,
+        peak_is_initial_state=peak == 0,
+        peak_stress=float(tension[peak]),
+        peak_time=float(history.times[peak]),
+        peak_uptake=float(history.uptake_fraction[peak]),
+        moisture_at_peak=moisture,
+        yield_low=yields[0],
+        yield_nominal=yields[1],
+        yield_high=yields[2],
+        equilibrium_stress=float(tension[-1]),
+        stress_free_moisture=history.mechanics_model.stress_free_moisture,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Moisture cycling
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class MoistureCycleAssessment:
+    """The stress cycle a wet/dry excursion imposes, with no external load change.
+
+    Full fatigue analysis is out of scope (see the README's Tier 3 section),
+    but the stress range a moisture cycle produces is a direct output of the
+    two transient cases and is worth stating: if it is a large fraction of the
+    tensile strength at a strongly negative R ratio, the part is being fatigue
+    loaded by humidity alone, and no amount of looking at the mechanical duty
+    cycle will reveal it.
+    """
+
+    peak_tension: float
+    peak_compression: float
+    #: Tensile strength at the moisture content where the tensile peak occurs.
+    uts_low: float
+    uts_nominal: float
+    uts_high: float
+    #: Time for the bulk to complete half a wet/dry excursion.
+    bulk_half_time: float
+    #: Whether the hole wall, being an exposed surface, tracks ambient humidity
+    #: far faster than the bulk does.
+    hole_wall_tracks_ambient: bool = True
+
+    @property
+    def stress_range(self) -> float:
+        """Peak-to-peak swing over a full wet/dry cycle, MPa."""
+        return self.peak_tension - self.peak_compression
+
+    @property
+    def stress_amplitude(self) -> float:
+        return 0.5 * self.stress_range
+
+    @property
+    def mean_stress(self) -> float:
+        return 0.5 * (self.peak_tension + self.peak_compression)
+
+    @property
+    def r_ratio(self) -> float:
+        """``sigma_min / sigma_max``. -1 is fully reversed."""
+        if self.peak_tension == 0.0:
+            return float("nan")
+        return self.peak_compression / self.peak_tension
+
+    def amplitude_over_uts(self, corner: str = "nominal") -> float:
+        uts = {"low": self.uts_low, "nominal": self.uts_nominal, "high": self.uts_high}[
+            corner
+        ]
+        return self.stress_amplitude / uts
+
+    @property
+    def is_significant(self) -> bool:
+        """Amplitude above ~20% of UTS at a negative R is worth chasing.
+
+        Unfilled PA66's fully-reversed fatigue strength at 1e6 cycles sits
+        roughly in the 20-30% of UTS band. An amplitude at or above the bottom
+        of that band means the moisture cycle alone puts the part in the
+        finite-life regime.
+        """
+        return self.amplitude_over_uts("low") >= 0.20 and self.r_ratio < 0.0
+
+    def summary(self) -> str:
+        return "\n".join(
+            [
+                "MOISTURE CYCLING -- THE STRESS CYCLE WITH NO LOAD CYCLE",
+                "=" * 60,
+                "",
+                "  Combining the two cases above, one full wet/dry excursion swings",
+                "  the hole-edge stress between:",
+                "",
+                f"    peak tension (dried)       {self.peak_tension:8.2f} MPa",
+                f"    peak compression (wet)     {self.peak_compression:8.2f} MPa",
+                f"    stress range               {self.stress_range:8.2f} MPa",
+                f"    amplitude                  {self.stress_amplitude:8.2f} MPa",
+                f"    mean stress                {self.mean_stress:8.2f} MPa",
+                f"    R = sigma_min / sigma_max  {self.r_ratio:8.2f}",
+                "",
+                "  Amplitude as a fraction of PA66 tensile strength:",
+                f"    strongest UTS {self.amplitude_over_uts('high'):.2f}   "
+                f"nominal {self.amplitude_over_uts('nominal'):.2f}   "
+                f"weakest UTS {self.amplitude_over_uts('low'):.2f}",
+                "",
+                f"  Bulk half-cycle time: {self.bulk_half_time / SECONDS_PER_DAY:.1f} d.",
+            ]
+        )
+
+    def commentary(self) -> list[str]:
+        """Prose for the run script. Returns unwrapped paragraphs."""
+        out = []
+        if self.is_significant:
+            out.append(
+                "WORTH CHASING. The moisture cycle alone drives a stress amplitude "
+                f"of {self.stress_amplitude:.0f} MPa at R = {self.r_ratio:.1f}, which is "
+                f"{self.amplitude_over_uts('high'):.0%} to "
+                f"{self.amplitude_over_uts('low'):.0%} of PA66's tensile strength. "
+                "Unfilled PA66's fully-reversed fatigue strength at 1e6 cycles is "
+                "typically 20-30% of UTS, so this sits in or above the finite-life "
+                "band -- from humidity alone, with the mechanical duty cycle "
+                "completely unchanged. A fatigue assessment that only counts "
+                "ratchet tightening cycles would miss it entirely."
+            )
+        else:
+            out.append(
+                f"Probably not the driver on its own. The moisture cycle swings the "
+                f"hole edge by {self.stress_range:.0f} MPa at R = {self.r_ratio:.1f}, "
+                f"an amplitude of {self.amplitude_over_uts('high'):.0%} to "
+                f"{self.amplitude_over_uts('low'):.0%} of UTS, which is at or below "
+                "PA66's usual fully-reversed endurance band. Worth re-checking if the "
+                "stress-free or property assumptions move."
+            )
+
+        out.append(
+            "TWO TIME SCALES, AND THE FAST ONE IS AT THE CRACK SITE. The bulk takes "
+            f"about {self.bulk_half_time / SECONDS_PER_DAY:.0f} days to go half way "
+            "through a moisture change, so full bulk wet/dry cycles are seasonal and "
+            "few. But a hole wall is an exposed surface at every depth, so it "
+            "equilibrates with ambient humidity in hours. The hole edge is therefore "
+            "simultaneously the most highly stressed location AND the one that cycles "
+            "fastest -- it can see near-full-amplitude excursions daily while the bulk "
+            "barely moves. Counting cycles off the bulk time constant would "
+            "under-count by orders of magnitude."
+        )
+
+        out.append(
+            "WHY THIS IS NOT A FATIGUE ANALYSIS. There is no cycle counting here, no "
+            "S-N or Paris-law data for the actual grade at the right moisture state, "
+            "no account of the frequency and temperature effects that dominate polymer "
+            "fatigue, no hysteretic self-heating, and no crack-growth model. The stress "
+            "range above is an elastic, single-excursion result -- it says a cyclic "
+            "driver exists and roughly how big it is, not how long the part lasts. "
+            "Sizing that is Tier 3."
+        )
+        return out
+
+
+def moisture_cycle_assessment(
+    absorption: StressHistory, desorption: StressHistory
+) -> MoistureCycleAssessment:
+    """Combine a wetting and a drying case into the cycle they jointly describe.
+
+    The tensile half comes from the drying case and the compressive half from
+    the wetting case, because each case only traverses its own direction.
+    """
+    tension = float(np.max(desorption.peak_tensile_envelope()))
+    compression = float(np.min(absorption.peak_compressive_envelope()))
+
+    peak = int(np.argmax(desorption.peak_tensile_envelope()))
+    holes = desorption.representative_holes()
+    moisture_at_peak = float(np.mean([h.mean_concentration[peak] for h in holes]))
+    uts = tuple(
+        float(pa66_properties(moisture_at_peak, corner=corner)[3])
+        for corner in ("low", "nominal", "high")
+    )
+
+    return MoistureCycleAssessment(
+        peak_tension=tension,
+        peak_compression=compression,
+        uts_low=uts[0],
+        uts_nominal=uts[1],
+        uts_high=uts[2],
+        bulk_half_time=desorption.diffusion.model.characteristic_time(),
+    )
+
+
+def relaxation_bracket(
+    strip: StripMesh,
+    history: StressHistory,
+    conditioned_moisture: float,
+    fractions: tuple = (0.0, 0.5, 1.0),
+) -> dict:
+    """Peak hole-edge tension against the assumed stress-free state.
+
+    Re-solves the mechanics at the instant of peak tension for each relaxation
+    fraction, so the reader can see how much of the answer rests on an
+    assumption nobody has measured. One extra solve per fraction, not a whole
+    extra transient.
+    """
+    from dataclasses import replace as dc_replace
+
+    from . import mechanics as mech
+
+    peak = int(np.argmax(history.peak_tensile_envelope()))
+    concentration = history.diffusion.concentration[history.indices[peak]]
+    geometry = history.geometry
+
+    out = {}
+    for fraction in fractions:
+        stress_free = mech.relaxed_stress_free_moisture(conditioned_moisture, fraction)
+        model = dc_replace(history.mechanics_model, stress_free_moisture=stress_free)
+        result = mech.solve(strip, model, concentration)
+        edges = [
+            result.hole_edges[name]["max_principal"]
+            for i, name in enumerate(strip.hole_boundaries)
+            if geometry.is_interior_hole(i)
+        ] or [e["max_principal"] for e in result.hole_edges.values()]
+        out[fraction] = {
+            "stress_free_moisture": stress_free,
+            "peak_tensile": float(np.max(edges)),
+        }
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Plots
 # ---------------------------------------------------------------------------
 
@@ -688,6 +1078,111 @@ def plot_field(
     return path
 
 
+def plot_moisture_cycle(
+    absorption: StressHistory,
+    desorption: StressHistory,
+    cycle: MoistureCycleAssessment,
+    path: Path,
+) -> Path:
+    """Both halves of a wet/dry excursion on one stress axis, against log time.
+
+    Two things the figure has to show:
+
+    * the vertical extent -- the strap traverses a large fraction of its
+      tensile strength at the hole edge with no change in mechanical load;
+    * the two time scales -- the hole wall is an exposed surface, so it
+      slams to its new stress within hours, while the reinforced bulk takes
+      weeks to follow. Plotting against uptake fraction hides this, because
+      the hole wall is done inside the first few percent.
+    """
+    plt, fig = _figure(figsize=(10.0, 5.8))
+    ax = fig.add_subplot(111)
+
+    def _days(history):
+        # Substitute a small positive value for t = 0 so it is visible on a
+        # log axis rather than silently dropped.
+        days = history.times_days.copy()
+        if len(days) > 1 and days[0] <= 0:
+            days[0] = days[1] / 5.0
+        return days
+
+    for history, label, colour in (
+        (absorption, "absorption (wetting)", "tab:blue"),
+        (desorption, "desorption (drying)", "tab:red"),
+    ):
+        days = _days(history)
+        ax.plot(
+            days,
+            history.peak_tensile_envelope(),
+            "-o",
+            ms=3.5,
+            color=colour,
+            label=f"{label} -- hole edge",
+        )
+        ax.plot(
+            days,
+            history.bulk_sxx,
+            "--",
+            lw=1.4,
+            color=colour,
+            alpha=0.6,
+            label=f"{label} -- reinforced bulk",
+        )
+
+    ax.axhline(0.0, color="0.5", lw=0.9)
+    ax.axhspan(
+        cycle.peak_compression, cycle.peak_tension, color="0.75", alpha=0.22, zorder=0
+    )
+    ax.axhline(
+        cycle.uts_low,
+        color="firebrick",
+        ls=":",
+        lw=1.1,
+        label="+/- UTS (weak end of bracket)",
+    )
+    ax.axhline(-cycle.uts_low, color="firebrick", ls=":", lw=1.1)
+
+    ax.set_xscale("log")
+    ax.annotate(
+        f"cycle range {cycle.stress_range:.0f} MPa   R = {cycle.r_ratio:.2f}\n"
+        f"amplitude {cycle.stress_amplitude:.0f} MPa "
+        f"= {cycle.amplitude_over_uts('nominal'):.0%} of UTS",
+        xy=(0.5, 0.5),
+        xycoords="axes fraction",
+        ha="center",
+        va="center",
+        fontsize=9,
+        bbox=dict(boxstyle="round,pad=0.45", fc="white", ec="0.6", alpha=0.92),
+    )
+
+    bulk_days = cycle.bulk_half_time / SECONDS_PER_DAY
+    ax.axvline(bulk_days, color="0.35", lw=1.0, ls="-.")
+    ax.annotate(
+        f"bulk half-response {bulk_days:.0f} d",
+        xy=(bulk_days, 0.97),
+        xycoords=ax.get_xaxis_transform(),
+        xytext=(5, -2),
+        textcoords="offset points",
+        fontsize=7.5,
+        color="0.3",
+        va="top",
+    )
+
+    ax.set_xlabel("time (days, log scale)")
+    ax.set_ylabel("principal stress (MPa)")
+    ax.set_title(
+        "One wet/dry moisture cycle -- tension positive\n"
+        "no mechanical load changes anywhere on this plot; "
+        "the hole edge leads the bulk by weeks"
+    )
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=7.5, ncol=2, loc="best")
+    fig.tight_layout()
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+    return path
+
+
 # ---------------------------------------------------------------------------
 # Machine-readable summary
 # ---------------------------------------------------------------------------
@@ -698,6 +1193,8 @@ def write_summary(
     comparison: Tier1Comparison,
     verdict: FreeEdgeVerdict,
     path: Path,
+    tensile: "TensileAssessment | None" = None,
+    cycle: "MoistureCycleAssessment | None" = None,
 ) -> Path:
     """Dump the headline numbers as JSON, for diffing between runs."""
     payload = {
@@ -760,6 +1257,39 @@ def write_summary(
             "hole_edge_von_mises_MPa": history.peak_von_mises_envelope().tolist(),
         },
     }
+    if tensile is not None:
+        payload["peak_tensile"] = {
+            "stress_MPa": tensile.peak_stress,
+            "time_days": tensile.peak_time / SECONDS_PER_DAY,
+            "uptake_fraction_at_peak": tensile.peak_uptake,
+            "moisture_at_peak": tensile.moisture_at_peak,
+            "equilibrium_stress_MPa": tensile.equilibrium_stress,
+            "gradient_contribution_MPa": tensile.gradient_contribution,
+            "stress_free_moisture": tensile.stress_free_moisture,
+            "yield_low_MPa": tensile.yield_low,
+            "yield_nominal_MPa": tensile.yield_nominal,
+            "yield_high_MPa": tensile.yield_high,
+            "utilisation_low": tensile.utilisation_low,
+            "utilisation_nominal": tensile.utilisation_nominal,
+            "utilisation_high": tensile.utilisation_high,
+            "reaches_yield": tensile.reaches_yield,
+        }
+
+    if cycle is not None:
+        payload["moisture_cycle"] = {
+            "peak_tension_MPa": cycle.peak_tension,
+            "peak_compression_MPa": cycle.peak_compression,
+            "stress_range_MPa": cycle.stress_range,
+            "stress_amplitude_MPa": cycle.stress_amplitude,
+            "mean_stress_MPa": cycle.mean_stress,
+            "r_ratio": cycle.r_ratio,
+            "amplitude_over_uts_low": cycle.amplitude_over_uts("low"),
+            "amplitude_over_uts_nominal": cycle.amplitude_over_uts("nominal"),
+            "amplitude_over_uts_high": cycle.amplitude_over_uts("high"),
+            "bulk_half_cycle_days": cycle.bulk_half_time / SECONDS_PER_DAY,
+            "is_significant": cycle.is_significant,
+        }
+
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2))

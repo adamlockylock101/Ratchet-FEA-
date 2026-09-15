@@ -20,6 +20,10 @@ PA66 ratchet belt strap cracks during ordinary service.
 ## Contents
 
 - [What the investigation has found so far](#what-the-investigation-has-found-so-far)
+  - [Tier 1 — the mechanical load is not the problem](#tier-1--the-mechanical-load-is-not-the-problem)
+  - [Tier 2 — the row shields itself, and the sign matters](#tier-2--the-row-shields-itself-and-the-sign-matters)
+  - [The drying half of the cycle is where the tension is](#the-drying-half-of-the-cycle-is-where-the-tension-is)
+  - [Moisture cycling — a stress cycle with no load cycle](#moisture-cycling--a-stress-cycle-with-no-load-cycle)
 - [Tier structure](#tier-structure)
 - [Units](#units)
 - [Installation](#installation)
@@ -68,39 +72,108 @@ non-uniform*.
 | Constrained swelling stress, reinforced bulk | 31.2 MPa | **30.5 MPa** | agrees to 2 % — the formula and the FE solve the same problem here |
 | Time to half moisture uptake | 8.7 d | **8.4 d** | in-plane ingress adds a little to the through-thickness path |
 
-**The sign of the swelling stress is the crux, and it is easy to get wrong.**
-Constrained *swelling* during absorption is **compressive** — and compression
-does not open a crack. At nominal properties the hole edge sits at about
-−31 MPa compressive, 0.81 of the moisture-softened yield strength, and the
-tensile stress from the service load is swamped by it.
+**The sign of the swelling stress is the crux.** Constrained *swelling* during
+absorption is **compressive** — and compression does not open a crack. At
+nominal properties the hole edge sits at about −31 MPa, 0.81 of the
+moisture-softened yield strength, and the tensile stress from the service load
+is swamped by it. Wetting, on its own, is not a crack driver.
 
-So on the assumptions as they currently stand, this model does **not** show a
-tensile crack driver. What it shows instead is three candidate routes to one,
-in descending order of how much evidence would be needed to settle them:
+### The drying half of the cycle is where the tension is
 
-1. **The stress-free reference.** Every stress is measured from the moisture
-   content at which the polymer is taken to be stress-free. That is currently
-   assumed to be dry-as-moulded, and it is the single largest lever in the
-   whole model:
+The strap conditions to its service humidity, then dries back out — a hot car,
+a dry winter, a wash-and-dry cycle. Shrinkage against the band reverses the
+sign, and the hole edge is pulled:
 
-   | stress-free moisture | absorption: peak hole-edge tension | desorption: peak hole-edge tension |
-   |---|---|---|
-   | 0.000 (assembled dry — current default) | +1.4 MPa | −12.6 MPa (compression throughout) |
-   | 0.025 (stress-free at 50 % RH) | **+29.7 MPa** | +1.3 MPa |
-   | 0.085 (stress-free saturated) | **+100 MPa** (beyond strength — unphysical, shown to bound the lever) |
+| | absorption (wetting) | **desorption (drying)** |
+|---|---|---|
+| excursion | as-moulded → saturated | **50 % RH equilibrium → as-moulded** |
+| peak hole-edge tension | +1.4 MPa | **+31.6 MPa** |
+| peak hole-edge compression | −31.1 MPa | −0.2 MPa |
+| yield strength at that moisture | 37.9 MPa (wet) | **75–90 MPa (dry)** |
+| utilisation | 0.02 | **0.35–0.42** |
 
-   If the strap is stress-free anywhere near its in-service moisture, then
-   **drying below that** — a hot car, a dry winter, a wash-and-dry cycle — puts
-   tens of MPa of tension exactly where the mechanical stress concentration
-   already is. Reproduce with `--stress-free-moisture 0.025`.
+Two things about that tensile peak:
 
-2. **Compressive yielding and ratcheting.** At the high bracket corner the
+- **It arrives essentially immediately, not over weeks.** A hole wall is an
+  exposed surface at every depth, so it reaches its new stress as fast as the
+  time grid resolves — the recorded peak is at the first stored step (tens of
+  minutes), and refining the grid only moves it earlier. The reinforced *bulk*
+  takes weeks to follow, as `moisture_cycle.png` shows. The peak is +31.6 MPa
+  against +29.7 MPa at full equilibrium; the extra ~1.9 MPa is the
+  moisture-gradient contribution, the hole wall shrinking against a still-wet
+  interior.
+- **It stays below yield across the whole bracket** — worst case 0.42 of yield,
+  because a dried strap is both more highly stressed *and* roughly twice as
+  strong as the same strap wet. A single drying excursion does not, on these
+  numbers, yield the polymer.
+
+#### This depends entirely on the stress-free state
+
+A linear-elastic model has one fixed stress-free state. If the strap is
+stress-free as moulded, drying can only return the stress to zero — never past
+it, so constrained shrinkage tension does not exist. The tension above requires
+the stress-free state to have **migrated toward the conditioned moisture**,
+which is what happens physically when a polymer is held at constant strain at
+20–30 MPa for weeks (viscoelastic relaxation), or when it has already yielded
+in compression.
+
+`--relaxation` brackets the two readings, and the run prints the span:
+
+| `--relaxation` | stress-free moisture | peak tension | reading |
+|---|---|---|---|
+| 0.0 | 0.0000 | +2.4 MPa | purely elastic; drying only unloads |
+| 0.5 | 0.0125 | +17.0 MPa | partially relaxed |
+| **1.0** (default for desorption) | 0.0250 | **+31.6 MPa** | fully relaxed at the conditioned state |
+
+Nothing in this repository can settle which row is right. Hole-drilling
+residual strain on a conditioned sample would measure it directly. It is
+verification item #1.
+
+### Moisture cycling — a stress cycle with no load cycle
+
+The two cases are two halves of one excursion, so the run combines them:
+
+| | low corner | nominal | high corner |
+|---|---|---|---|
+| peak tension (dried) | +18.3 MPa | **+31.6 MPa** | +50.9 MPa |
+| peak compression (wet) | −16.6 MPa | **−31.1 MPa** | −53.7 MPa |
+| stress range | 34.9 MPa | **62.8 MPa** | 104.6 MPa |
+| R = σ_min/σ_max | −0.91 | **−0.98** | −1.06 |
+| amplitude ÷ UTS | 0.18–0.23 | **0.33–0.42** | 0.55–0.70 |
+
+**A wet/dry cycle swings the hole edge through essentially fully reversed
+loading at a third to a half of tensile strength, with the mechanical duty
+cycle completely unchanged.** Unfilled PA66's fully-reversed fatigue strength
+at 10⁶ cycles is typically 20–30 % of UTS, so the nominal and high corners sit
+in or above the finite-life band; only the low corner is marginal. A fatigue
+assessment that counts ratchet-tightening cycles would miss this entirely.
+
+Two caveats that matter as much as the number:
+
+- **Cycle counting must come off the hole wall, not the bulk.** The bulk takes
+  ~9 days to go half way through a moisture change, so bulk wet/dry cycles are
+  seasonal and few. The hole wall equilibrates in hours. The hole edge is
+  simultaneously the most highly stressed location and the fastest-cycling one,
+  and counting off the bulk time constant would under-count by orders of
+  magnitude.
+- **This is not a fatigue analysis.** No cycle counting, no S-N or Paris-law
+  data for the grade at the right moisture state, no frequency or temperature
+  effects, no hysteretic self-heating, no crack-growth model. The stress range
+  is an elastic single-excursion result: it says a cyclic driver exists and
+  roughly how big it is, not how long the part lasts. Sizing that is Tier 3.
+
+### Still unresolved
+
+Two other routes to a crack driver remain open and are outside what this model
+can settle:
+
+1. **Compressive yielding and ratcheting.** At the high bracket corner the
    hole-edge von Mises stress reaches 1.42 × yield during absorption (0.42 × at
    the low corner — the conclusion flips across the literature range). Yielding
-   in compression locks in plastic strain that reappears as tension on drying.
-   Modelling that needs plasticity and a cyclic moisture history — Tier 3.
-
-3. **Through-thickness gradients.** This is a membrane model fed a
+   in compression locks in plastic strain that reappears as tension on drying,
+   and would push the stress-free state toward full relaxation by itself. Needs
+   plasticity and a cyclic moisture history — Tier 3.
+2. **Through-thickness gradients.** This is a membrane model fed a
    thickness-averaged concentration, so it is blind to the drying skin pulled
    into tension over a still-wet core — the classic moisture-driven surface
    cracking mechanism in polyamides. A low tensile stress here is **not**
@@ -189,12 +262,25 @@ python scripts/run_tier1_analytical.py --tension 800 --hole-diameter 4.6
 ### Tier 2 — coupled FE
 
 ```bash
-python scripts/run_tier2_fe.py                          # absorption, nominal
-python scripts/run_tier2_fe.py --quick                  # ~9 s pipeline check
-python scripts/run_tier2_fe.py --case both --corner high
-python scripts/run_tier2_fe.py --stress-free-moisture 0.025
+python scripts/run_tier2_fe.py                          # both cases, nominal
+python scripts/run_tier2_fe.py --quick                  # ~15 s pipeline check
+python scripts/run_tier2_fe.py --corner high            # bracket corner
+python scripts/run_tier2_fe.py --case desorption        # drying only
+python scripts/run_tier2_fe.py --relaxation 0           # purely elastic reference
 python scripts/run_tier2_fe.py --mesh-convergence       # Kt convergence only
 ```
+
+`--case` defaults to `both`, because the tensile and compressive halves of a
+moisture cycle come from different excursions and only mean something together.
+
+| case | excursion | stress-free reference | sign at the hole edge |
+|---|---|---|---|
+| `absorption` | as-moulded → saturated | as-moulded (nothing to relax to) | compressive |
+| `desorption` | 50 % RH equilibrium → as-moulded | conditioned state (`--relaxation 1`) | **tensile** |
+
+`--relaxation` (0 to 1) sets what fraction of the starting equilibrium moisture
+the polymer is taken to be stress-free at; `--stress-free-moisture` sets the
+value directly and overrides it.
 
 Outputs land in `results/<case>/`:
 
@@ -203,9 +289,10 @@ Outputs land in `results/<case>/`:
 | `hole_stress_vs_time.png` | peak principal stress at every hole edge against time (log) |
 | `stress_vs_uptake.png` | hole-edge stress and yield utilisation against moisture uptake |
 | `tier1_cross_check.png` | the three Tier 1 ↔ Tier 2 comparisons |
+| `moisture_cycle.png` | both excursions on one stress axis, with the cycle range and R ratio (written under `desorption/` when both cases run) |
 | `concentration_field.png` | thickness-averaged moisture at peak hole-edge von Mises |
 | `stress_field_max_principal.png`, `stress_field_von_mises.png` | equilibrium PA66 stress |
-| `summary.json` | every headline number, for diffing between runs |
+| `summary.json` | every headline number, including `peak_tensile` and `moisture_cycle` blocks, for diffing between runs |
 
 Useful flags for isolating one effect at a time: `--no-band`, `--no-tension`,
 `--fixed-modulus`.
@@ -343,7 +430,14 @@ the value toward the interior and systematically under-reports `Kt`.
 
 The polymer modulus is evaluated pointwise from the local concentration, so the
 water that drives the swelling also softens the polymer resisting it. Holding it
-fixed overstates the swelling stress by 2–3× (`--fixed-modulus` to see).
+fixed overstates the swelling stress by 2–3× (`--fixed-modulus` to see). The
+same effect makes a moisture cycle asymmetric in a useful way: drying stiffens
+PA66, so the tensile half of a cycle is produced at a higher modulus than the
+compressive half.
+
+`relaxed_stress_free_moisture()` sets the moisture content the eigenstrain is
+measured from. It carries the whole argument about whether drying produces
+tension or merely unloads, and is documented at length in the source.
 
 ### `postprocess.py` — extraction, plots, cross-check
 
@@ -368,7 +462,7 @@ Anything outside a factor of 2 is flagged as a disagreement. The comparison uses
 the same bracket corner as the FE run, because the diffusivity bracket spans a
 decade.
 
-Beyond that, the test suite (**325 tests**) verifies:
+Beyond that, the test suite (**385 tests**) verifies:
 
 - the FE `Kt` against the **Howland/Peterson closed form** for a single hole in
   a finite-width strip (agrees to 6 %, converged to 0.4 %);
@@ -384,8 +478,8 @@ Beyond that, the test suite (**325 tests**) verifies:
   re-runs the study unchanged.
 
 ```bash
-pytest -q                            # all 325, ~8 s
-pytest -q -m "not requires_gmsh"     # 244 of them, on a machine without gmsh
+pytest -q                            # all 385, ~30 s
+pytest -q -m "not requires_gmsh"     # 287 of them, on a machine without gmsh
 ```
 
 ### A limitation the results forced into the open
@@ -414,7 +508,7 @@ change a conclusion:
 
 | # | Assumption | Why it matters | How to settle it |
 |---|---|---|---|
-| 1 | **Stress-free moisture content = 0** (`mechanics.py`) | Largest single lever in the model. Decides whether the hole edges ever see tension at all. | Anneal a sample and measure the dimensional change; or hole-drilling residual strain |
+| 1 | **How far the stress-free state has relaxed toward the conditioned moisture** (`mechanics.relaxed_stress_free_moisture`) | Largest single lever in the model. Spans +2.4 to +31.6 MPa of hole-edge tension on drying — the difference between "drying only unloads" and "drying is the crack driver" | Hole-drilling residual strain on a conditioned sample; or anneal a sample and measure the dimensional change |
 | 2 | **The holes pierce the steel band** (`geometry.py`) | If the band is instead split or interrupted around the holes, the longitudinal constraint at the hole is released and the mechanism weakens qualitatively | Section through a hole; look for steel at the hole wall |
 | 3 | **A steel band exists, 18 × 0.8 mm** | Its existence is *inferred*, not observed. No band means no constrained swelling at all | Section and etch, X-ray, or a magnet on a scrap length |
 | 4 | **PA66 grade and its properties** | Yield strength brackets span 30–55 MPa; the yielding conclusion flips across them. Glass fill would change everything | Moulder's part record; FTIR + DSC + ash test |
@@ -451,18 +545,25 @@ Grep for `VERIFY:` across `src/` to find every assumption flagged in place.
 
 In the order they would change the answer:
 
-1. **Through-thickness moisture gradients.** A membrane model fed a
+1. **Fatigue under moisture cycling.** Tier 2 now says a fully-reversed stress
+   cycle of 35–105 MPa exists at the hole edge from humidity alone. Turning
+   that into a life needs S-N or crack-growth data for the actual grade at the
+   right moisture state, a realistic humidity history to count cycles from (off
+   the *hole wall* time constant, not the bulk), and the frequency and
+   temperature effects that dominate polymer fatigue.
+2. **Through-thickness moisture gradients.** A membrane model fed a
    thickness-averaged concentration is blind to a drying skin in tension over a
    wet core — the classic polyamide surface-cracking mechanism. Needs a 3D or
    layered through-thickness model.
-2. **Plasticity and moisture ratcheting.** Compressive yielding during wetting
-   locks in plastic strain that reappears as tension on drying. Needs an
+3. **Plasticity and moisture ratcheting.** Compressive yielding during wetting
+   locks in plastic strain that reappears as tension on drying, and would drive
+   the stress-free state toward full relaxation on its own. Needs an
    elastic-plastic model and a cyclic wet/dry history.
-3. **The laminate free-edge boundary layer** at the hole walls (see above) —
+4. **The laminate free-edge boundary layer** at the hole walls (see above) —
    needs interlaminar shear, so 3D.
-4. **Fatigue and creep rupture.** The part fails in repeated service, not under
-   a monotonic pull. Needs cyclic data at the right moisture state.
-5. **Fracture mechanics proper.** Once a crack exists, `K`/`J` at the hole edge
+5. **Creep rupture.** Static fatigue under the sustained swelling stress, which
+   a monotonic yield strength says nothing about.
+6. **Fracture mechanics proper.** Once a crack exists, `K`/`J` at the hole edge
    and a growth law — which is where the "fracture mechanics" in the title
    eventually has to land.
 
@@ -483,7 +584,7 @@ src/ratchet_fea/
 scripts/
   run_tier1_analytical.py
   run_tier2_fe.py
-tests/             one module per source module, 325 tests
+tests/             one module per source module, 385 tests
 ```
 
 Tier 2 modules are imported lazily from `ratchet_fea/__init__.py`, so Tier 1
@@ -494,8 +595,8 @@ works without scikit-fem, gmsh or matplotlib installed.
 ## Development
 
 ```bash
-pytest -q                            # everything (325 tests, ~8 s)
-pytest -q -m "not requires_gmsh"     # 244, skipping anything needing gmsh
+pytest -q                            # everything (385 tests, ~30 s)
+pytest -q -m "not requires_gmsh"     # 287, skipping anything needing gmsh
 pytest tests/test_mechanics.py -q    # one module
 ```
 

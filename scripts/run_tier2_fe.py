@@ -27,7 +27,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -46,12 +46,55 @@ from ratchet_fea.provenance import (  # noqa: E402
     format_verification_report,
 )
 
+@dataclass(frozen=True)
+class Case:
+    """One moisture excursion, with the stress-free assumption it implies."""
+
+    name: str
+    start: dif.MoistureState
+    end: dif.MoistureState
+    #: Fraction of the STARTING equilibrium moisture at which the polymer is
+    #: taken to be stress-free. See mechanics.relaxed_stress_free_moisture --
+    #: this is the assumption that decides whether drying produces tension or
+    #: merely unloads compression.
+    relaxation: float
+    description: str
+
+
 CASES = {
-    # (start state, end state). Absorption is the service condition; desorption
-    # is what happens between uses, and is the direction that turns the
-    # constrained-swelling magnitude into tension near a drying surface.
-    "absorption": (dif.MoistureState.DRY, dif.MoistureState.IMMERSED),
-    "desorption": (dif.MoistureState.IMMERSED, dif.MoistureState.RH50),
+    c.name: c
+    for c in (
+        Case(
+            name="absorption",
+            start=dif.MoistureState.DRY,
+            end=dif.MoistureState.IMMERSED,
+            # The strap starts as-moulded, which IS the stress-free state, so
+            # the relaxation fraction has nothing to act on and the value is
+            # immaterial here.
+            relaxation=0.0,
+            description=(
+                "As-moulded strap wetting through to saturation. Swelling "
+                "against the band, so compressive."
+            ),
+        ),
+        Case(
+            name="desorption",
+            start=dif.MoistureState.RH50,
+            end=dif.MoistureState.DRY,
+            # The strap has sat at its service humidity long enough to reach
+            # equilibrium, and a polymer held at constant strain for weeks
+            # relaxes -- so the conditioned state is taken as stress-free.
+            # --relaxation overrides; 0 gives the purely elastic reading where
+            # drying only unloads.
+            relaxation=1.0,
+            description=(
+                "Strap conditioned to 50% RH equilibrium, then dried back out. "
+                "Shrinkage against the band, so tensile. Drying fully to "
+                "as-moulded is the bounding excursion; partial drying scales "
+                "roughly with the moisture change."
+            ),
+        ),
+    )
 }
 
 
@@ -62,8 +105,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--case",
         choices=(*CASES, "both"),
-        default="absorption",
-        help="moisture transition to model (default: absorption)",
+        default="both",
+        help="moisture excursion(s) to model (default: both, because the "
+        "tensile and compressive halves of a moisture cycle come from "
+        "different cases and only mean something together)",
     )
     p.add_argument(
         "--corner",
@@ -115,12 +160,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="omit the mechanical load, to isolate the swelling stress",
     )
     mo.add_argument(
+        "--relaxation",
+        type=float,
+        default=None,
+        help="fraction of the STARTING equilibrium moisture at which the "
+        "polymer is stress-free: 0 = purely elastic, stress-free as moulded "
+        "(drying only unloads); 1 = fully relaxed at the conditioned state "
+        "(drying goes into tension). Defaults to the case's own value. "
+        "Overridden by --stress-free-moisture",
+    )
+    mo.add_argument(
         "--stress-free-moisture",
         type=float,
-        default=0.0,
-        help="moisture content at which the polymer is stress-free (default 0, "
-        "i.e. the strap was assembled around the band dry). Raising this is the "
-        "single biggest lever on whether drying produces tension -- see README",
+        default=None,
+        help="set the stress-free moisture content directly, in mass fraction, "
+        "instead of deriving it from --relaxation. The single biggest lever on "
+        "whether drying produces tension -- see README",
     )
     mo.add_argument(
         "--mesh-convergence",
@@ -193,8 +248,17 @@ def run_mesh_convergence(geometry, base_controls) -> int:
     return 0
 
 
+def resolve_stress_free_moisture(case, diffusion_model, args) -> float:
+    """Stress-free moisture for this case, from the flags or the case default."""
+    if args.stress_free_moisture is not None:
+        return args.stress_free_moisture
+    relaxation = case.relaxation if args.relaxation is None else args.relaxation
+    return mech.relaxed_stress_free_moisture(diffusion_model.c_initial, relaxation)
+
+
 def run_case(case_name, geometry, args, tier1, out_root) -> dict:
-    start_state, end_state = CASES[case_name]
+    case = CASES[case_name]
+    start_state, end_state = case.start, case.end
     out_dir = out_root / case_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -208,6 +272,8 @@ def run_case(case_name, geometry, args, tier1, out_root) -> dict:
     print("=" * 78)
     print(f"CASE: {case_name.upper()}  ({start_state.value} -> {end_state.value})")
     print("=" * 78)
+    for line in _wrap(case.description):
+        print(f"  {line}")
     print()
 
     t0 = time.perf_counter()
@@ -235,15 +301,22 @@ def run_case(case_name, geometry, args, tier1, out_root) -> dict:
     )
     print()
 
+    stress_free = resolve_stress_free_moisture(case, diffusion_model, args)
     mech_model = mech.MechanicsModel.from_materials(
         geometry,
         corner=args.corner,
         include_band=not args.no_band,
         include_tension=not args.no_tension,
         moisture_dependent_modulus=not args.fixed_modulus,
-        stress_free_moisture=args.stress_free_moisture,
+        stress_free_moisture=stress_free,
     )
     print(mech_model.summary())
+    if stress_free > 0:
+        print(
+            f"    (stress-free state taken at {stress_free:.4f}, i.e. the polymer "
+            "has relaxed at its\n     conditioning moisture -- this is what lets "
+            "drying produce tension. See --relaxation.)"
+        )
     print()
 
     history = post.stress_history(
@@ -254,8 +327,16 @@ def run_case(case_name, geometry, args, tier1, out_root) -> dict:
     comparison = post.compare_with_tier1(history, tier1, strip, kt_tier2)
     verdict = post.free_edge_validity(strip)
 
+    tensile = post.peak_tensile_assessment(history, case=case_name)
+
     print(comparison.summary())
     print()
+    print(tensile.summary())
+    print()
+
+    if tensile.develops_tension and diffusion_model.moisture_change < 0:
+        _print_relaxation_bracket(strip, history, diffusion_model)
+
     print("MODEL VALIDITY")
     print("--------------")
     for line in _wrap(verdict.message()):
@@ -266,7 +347,7 @@ def run_case(case_name, geometry, args, tier1, out_root) -> dict:
 
     figures = _write_figures(strip, history, comparison, diffusion_result, out_dir)
     summary_path = post.write_summary(
-        history, comparison, verdict, out_dir / "summary.json"
+        history, comparison, verdict, out_dir / "summary.json", tensile=tensile
     )
 
     print()
@@ -280,7 +361,42 @@ def run_case(case_name, geometry, args, tier1, out_root) -> dict:
         "history": history,
         "comparison": comparison,
         "verdict": verdict,
+        "tensile": tensile,
+        "strip": strip,
+        "out_dir": out_dir,
     }
+
+
+def _print_relaxation_bracket(strip, history, diffusion_model):
+    """Show how much of the tensile answer rests on the stress-free assumption."""
+    bracket = post.relaxation_bracket(
+        strip, history, conditioned_moisture=diffusion_model.c_initial
+    )
+    print("  HOW MUCH OF THAT RESTS ON THE STRESS-FREE ASSUMPTION")
+    print("  " + "-" * 52)
+    print(
+        f"    {'relaxation':>11} {'stress-free c':>14} {'peak tension':>13}   reading"
+    )
+    readings = {
+        0.0: "purely elastic; drying only unloads",
+        0.5: "partially relaxed",
+        1.0: "fully relaxed at the conditioned state",
+    }
+    for fraction, row in sorted(bracket.items()):
+        print(
+            f"    {fraction:>11.1f} {row['stress_free_moisture']:>14.4f} "
+            f"{row['peak_tensile']:>13.2f}   {readings.get(fraction, '')}"
+        )
+    print()
+    for line in _wrap(
+        "Nothing in this repository can settle which row is right. It depends on "
+        "how long the strap sits wet, at what temperature, and how far it has "
+        "yielded in compression. Hole-drilling residual strain on a conditioned "
+        "sample would measure it directly.",
+        width=72,
+    ):
+        print(f"    {line}")
+    print()
 
 
 def _write_figures(strip, history, comparison, diffusion_result, out_dir):
@@ -355,6 +471,65 @@ def _wrap(text, width=74):
     return textwrap.wrap(text, width=width)
 
 
+def _print_cycling_section(outcomes):
+    """The moisture-cycling angle, when both halves of the cycle were computed.
+
+    Returns the assessment so the caller can plot and record it, or None when
+    only one direction was run.
+    """
+    by_case = {o["case"]: o["history"] for o in outcomes}
+    if not {"absorption", "desorption"} <= set(by_case):
+        print("  MOISTURE CYCLING")
+        for line in _wrap(
+            "Only one half of the moisture cycle was computed, so the cycle's "
+            "stress range cannot be formed. Re-run with --case both to get the "
+            "tensile and compressive extremes together.",
+            width=72,
+        ):
+            print(f"    {line}")
+        print()
+        return None
+
+    cycle = post.moisture_cycle_assessment(
+        by_case["absorption"], by_case["desorption"]
+    )
+    for line in cycle.summary().splitlines():
+        print(f"  {line}" if line else "")
+    print()
+    for paragraph in cycle.commentary():
+        for line in _wrap(paragraph, width=72):
+            print(f"    {line}")
+        print()
+    return cycle
+
+
+def _write_cycle_outputs(outcomes, cycle):
+    """Write the combined-cycle figure and fold the cycle into each summary."""
+    by_case = {o["case"]: o for o in outcomes}
+    absorption = by_case["absorption"]
+    desorption = by_case["desorption"]
+
+    out_dir = Path(desorption["out_dir"])
+    path = post.plot_moisture_cycle(
+        absorption["history"],
+        desorption["history"],
+        cycle,
+        out_dir / "moisture_cycle.png",
+    )
+    print(f"  Wrote {path}")
+
+    for outcome in outcomes:
+        post.write_summary(
+            outcome["history"],
+            outcome["comparison"],
+            outcome["verdict"],
+            Path(outcome["out_dir"]) / "summary.json",
+            tensile=outcome["tensile"],
+            cycle=cycle,
+        )
+    print()
+
+
 def _print_interpretation(outcomes):
     print()
     print("=" * 78)
@@ -364,11 +539,13 @@ def _print_interpretation(outcomes):
 
     for outcome in outcomes:
         h = outcome["history"]
-        tens = float(np.max(h.peak_tensile_envelope()))
+        t = outcome["tensile"]
         comp = float(np.min(h.peak_compressive_envelope()))
         util = float(np.max(h.yield_utilisation_envelope()))
         print(f"  {outcome['case'].upper()}")
-        print(f"    peak hole-edge tension      {tens:8.2f} MPa")
+        best, worst = t.utilisation_range
+        print(f"    peak hole-edge tension      {t.peak_stress:8.2f} MPa"
+              f"   ({best:.2f}-{worst:.2f} of yield)")
         print(f"    peak hole-edge compression  {comp:8.2f} MPa")
         print(f"    peak von Mises / yield      {util:8.2f}")
         if util >= 1.0:
@@ -379,6 +556,10 @@ def _print_interpretation(outcomes):
         else:
             print("    -> stays below yield at the hole edge in this case.")
         print()
+
+    cycle = _print_cycling_section(outcomes)
+    if cycle is not None:
+        _write_cycle_outputs(outcomes, cycle)
 
     print("  READ THE SIGNS CAREFULLY.")
     for line in _wrap(
@@ -393,18 +574,21 @@ def _print_interpretation(outcomes):
         print(f"    {line}")
     print()
     print("  THE BIGGEST UNCERTAINTY IS THE STRESS-FREE STATE.")
+    references = ", ".join(
+        f"{o['case']} {o['history'].mechanics_model.stress_free_moisture:.4f}"
+        for o in outcomes
+    )
     for line in _wrap(
         "Every stress above is measured from the moisture content at which the "
-        f"polymer is taken to be stress-free, currently "
-        f"{outcomes[0]['history'].mechanics_model.stress_free_moisture:g} "
-        "(assembled dry). That reference is ASSUMED, not measured, and it moves "
-        "the answer more than anything else in the model: if the strap is "
-        "instead stress-free at its in-service equilibrium moisture, then "
-        "DRYING below that puts the hole edges into tens of MPa of TENSION, "
-        "right where the mechanical stress concentration already is. Re-run "
-        "with --stress-free-moisture 0.025 to see it. Resolving this is the "
-        "highest-value experiment available: anneal a sample and measure the "
-        "dimensional change, or measure residual strain by hole drilling."
+        f"polymer is taken to be stress-free ({references}). That reference is "
+        "ASSUMED, not measured, and it moves the answer more than anything "
+        "else in the model -- it is the difference between drying merely "
+        "unloading the compression and drying driving tens of MPa of tension "
+        "straight into the stress concentration. The per-case bracket above "
+        "shows the span. Resolving it is the highest-value experiment "
+        "available: hole-drilling residual strain on a conditioned sample, or "
+        "annealing a sample and measuring the dimensional change.",
+        width=72,
     ):
         print(f"    {line}")
     print()

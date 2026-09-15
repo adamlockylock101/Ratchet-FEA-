@@ -55,6 +55,12 @@ __all__ = [
 ]
 
 
+#: Tolerance below zero that counts as interpolation round-off rather than an
+#: error. Nine orders of magnitude below a realistic moisture content, so it
+#: cannot mask a genuine sign problem.
+_MOISTURE_ROUNDOFF = 1e-9
+
+
 class MoistureCondition(str, Enum):
     """Conditioning states at which PA66 properties are commonly quoted."""
 
@@ -368,8 +374,16 @@ def pa66_properties(moisture, corner: str = "nominal"):
     (voiding, hydrolysis) that a linear-elastic model cannot represent anyway.
     """
     c = np.asarray(moisture, dtype=float)
-    if np.any(c < 0.0):
-        raise ValueError("moisture content cannot be negative")
+    # A field that dries all the way to zero reaches exactly 0.0 at its nodes,
+    # and interpolating that onto quadrature points can land a few ulp below
+    # zero -- a P1 basis function evaluated on a facet is not guaranteed to be
+    # non-negative to the last bit. Clamp that away, but still reject anything
+    # negative enough to be a real error rather than round-off.
+    if np.any(c < -_MOISTURE_ROUNDOFF):
+        raise ValueError(
+            f"moisture content cannot be negative (minimum {np.min(c):g})"
+        )
+    c = np.clip(c, 0.0, None)
 
     knots = sorted(PA66_CONDITIONS, key=lambda g: g.moisture_content)
     xs = np.array([g.moisture_content for g in knots])
