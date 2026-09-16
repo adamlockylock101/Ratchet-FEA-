@@ -1,235 +1,173 @@
 # STP-RB-001 — PA66 ratchet belt strap, cracking in normal use
 
-A tiered fracture-mechanics investigation into why a perforated, steel-reinforced
-PA66 ratchet belt strap cracks during ordinary service.
+A static linear elastic fracture mechanics (LEFM) investigation: a crack is
+seeded at a perforation, the ratchet tension is applied, and the stress
+intensity factor at the crack tip is compared against the PA66 K_IC bracket
+over a sweep of crack lengths.
+
+**One question: once a crack has nucleated at a hole, does it run under normal
+ratchet load alone?**
 
 > ### ⚠️ Read this before quoting any number
 >
-> **Every dimension in this repository is a visual estimate scaled off
-> photographs. Every material property is a published range for generic
-> unfilled PA66, not a datasheet for the grade in the part.** Nobody has yet
-> put calipers, a micrometer or a DSC on a physical sample.
+> **Every dimension here is a visual estimate scaled off photographs. Every
+> material property is a published range for generic unfilled PA66, not a
+> datasheet for the grade in the part.** Nobody has yet put calipers, a
+> micrometer or a DSC on a physical sample.
 >
 > The code is built so that fixing this is a one-line change — see
 > [Replacing the placeholders](#replacing-the-placeholders). Until then, both
-> entry points print a table of every unverified input and what it would take
-> to measure it, and all results are screening-level only.
+> entry points print every unverified input and what it would take to measure
+> it, and all results are screening-level only.
 
 ---
 
 ## Contents
 
-- [What the investigation has found so far](#what-the-investigation-has-found-so-far)
-  - [Tier 1 — the mechanical load is not the problem](#tier-1--the-mechanical-load-is-not-the-problem)
-  - [Tier 2 — the row shields itself, and the sign matters](#tier-2--the-row-shields-itself-and-the-sign-matters)
-  - [The drying half of the cycle is where the tension is](#the-drying-half-of-the-cycle-is-where-the-tension-is)
-  - [Moisture cycling — a stress cycle with no load cycle](#moisture-cycling--a-stress-cycle-with-no-load-cycle)
-- [Tier structure](#tier-structure)
+- [The answer](#the-answer)
+  - [The two crack orientations are different problems](#the-two-crack-orientations-are-different-problems)
+  - [Transverse crack: K never reaches K_IC](#transverse-crack-k-never-reaches-k_ic)
+  - [Longitudinal crack: it cannot even open](#longitudinal-crack-it-cannot-even-open)
+  - [What that leaves](#what-that-leaves)
 - [Units](#units)
 - [Installation](#installation)
 - [Running it](#running-it)
 - [Replacing the placeholders](#replacing-the-placeholders)
-- [How the Tier 2 model works](#how-the-tier-2-model-works)
+- [How the model works](#how-the-model-works)
 - [Cross-checks and verification](#cross-checks-and-verification)
 - [Assumptions that still need a physical part](#assumptions-that-still-need-a-physical-part)
-- [What this model cannot do — Tier 3 scope](#what-this-model-cannot-do--tier-3-scope)
+- [What this model cannot do](#what-this-model-cannot-do)
 - [Repository layout](#repository-layout)
 - [Development](#development)
 
 ---
 
-## What the investigation has found so far
+## The answer
 
-All numbers below come from the **placeholder** geometry and the **nominal**
-corner of the literature property brackets. They are the shape of an argument,
-not a result.
+At the placeholder geometry, 500 N ratchet tension and PA66 conditioned to 50 %
+RH: **no. The crack does not propagate under ratchet load alone, in either
+orientation, and it is not close.**
 
-### Tier 1 — the mechanical load is not the problem
+### The two crack orientations are different problems
+
+The perforations run **along** the strap and the ratchet tension runs along it
+too. That makes the direction a crack runs out of a hole decisive, because the
+hoop stress on a hole wall in a uniaxial field is
+
+```
+sigma_theta = sigma (1 + 2 cos 2(theta - 90°))
+```
+
+— **+3σ** at 90° from the load axis, **−σ** on the axis itself.
+
+| | **transverse** | **longitudinal** |
+|---|---|---|
+| runs | across the strap, toward the free edge | along the strap, toward the next hole |
+| crack plane vs load | normal — mode I | parallel — not mode I |
+| hoop stress at the mouth | **+3σ** | **−σ** (compressive) |
+| ligament available | 10.5 mm | 6.0 mm |
+| can it open? | yes | **no, it is pressed shut** |
+
+The failed part is reported to have cracked **toward the adjacent hole**, which
+is the longitudinal case. Both are modelled and reported, so the comparison is
+on the page rather than in an argument.
+
+### Transverse crack: K never reaches K_IC
 
 | | value |
 |---|---|
-| Stress concentration at a hole, `Kt` (net section, isolated hole) | 2.59 |
-| Net-section stress at 500 N service tension | 7.9 MPa |
-| Peak mechanical stress at the hole edge | 20.5 MPa |
-| PA66 yield strength, 50 % RH conditioned | 40–55 MPa |
-| PA66 yield strength, water saturated | 30–45 MPa |
+| K at the observed 2 mm crack | **20.7 MPa·√mm** (0.66 MPa·√m) |
+| Peak K over the whole 10.5 mm ligament | **56.2 MPa·√mm** |
+| K_IC bracket, PA66 at 50 % RH | **94.9 – 173.9 MPa·√mm** (3.0 – 5.5 MPa·√m) |
+| Crack length at which K reaches K_IC | **never** |
+| Margin at the observed crack | **6.5×** (nominal), **4.6×** (weakest toughness) |
 
-The mechanical service load, even with the hole's concentration applied and the
-steel band's load-sharing ignored, stays below yield at **every** corner of the
-material bracket. Constrained moisture swelling does not: at saturation it
-reaches 17–54 MPa, which spans the conditioned yield strength.
+K rises with crack length but flattens out well below the toughness band — even
+with the crack grown to 8.9 mm, most of the way across the ligament. Converting
+that margin into something physical:
 
-**That is why Tier 2 exists.** Tier 1 cannot resolve two things: the holes are a
-*row*, not one isolated hole, and the swelling field is *transient and
-non-uniform*.
-
-### Tier 2 — the row shields itself, and the sign matters
-
-| quantity | Tier 1 | Tier 2 (FE) | reading |
-|---|---|---|---|
-| `Kt` at an interior hole | 2.587 | **2.229** | holes in a line along the load shield each other; Tier 1 is 14 % conservative |
-| `Kt` at an end hole | — | **2.417** | the first and last hole of the row genuinely carry more |
-| Constrained swelling stress, reinforced bulk | 31.2 MPa | **30.5 MPa** | agrees to 2 % — the formula and the FE solve the same problem here |
-| Time to half moisture uptake | 8.7 d | **8.4 d** | in-plane ingress adds a little to the through-thickness path |
-
-**The sign of the swelling stress is the crux.** Constrained *swelling* during
-absorption is **compressive** — and compression does not open a crack. At
-nominal properties the hole edge sits at about −31 MPa, 0.81 of the
-moisture-softened yield strength, and the tensile stress from the service load
-is swamped by it. Wetting, on its own, is not a crack driver.
-
-### The drying half of the cycle is where the tension is
-
-The strap conditions to its service humidity, then dries back out — a hot car,
-a dry winter, a wash-and-dry cycle. Shrinkage against the band reverses the
-sign, and the hole edge is pulled:
-
-| | absorption (wetting) | **desorption (drying)** |
+| | to fracture at the **observed 2 mm** crack | to fracture at a **near-breakthrough 8.9 mm** crack |
 |---|---|---|
-| excursion | as-moulded → saturated | **50 % RH equilibrium → as-moulded** |
-| peak hole-edge tension | +1.4 MPa | **+31.6 MPa** |
-| peak hole-edge compression | −31.1 MPa | −0.2 MPa |
-| yield strength at that moisture | 37.9 MPa (wet) | **75–90 MPa (dry)** |
-| utilisation | 0.02 | **0.35–0.42** |
+| weakest toughness corner | **2293 N** (4.6× service) | **845 N** (1.7× service) |
+| nominal | 3249 N (6.5×) | 1197 N (2.4×) |
 
-Two things about that tensile peak:
+Checked at the **dry-as-moulded** corner too — the brittlest state, K_IC
+2.5 MPa·√m — and it still never reaches it: margin 3.8× at the observed crack.
 
-- **It arrives essentially immediately, not over weeks.** A hole wall is an
-  exposed surface at every depth, so it reaches its new stress as fast as the
-  time grid resolves — the recorded peak is at the first stored step (tens of
-  minutes), and refining the grid only moves it earlier. The reinforced *bulk*
-  takes weeks to follow, as `moisture_cycle.png` shows. The peak is +31.6 MPa
-  against +29.7 MPa at full equilibrium; the extra ~1.9 MPa is the
-  moisture-gradient contribution, the hole wall shrinking against a still-wet
-  interior.
-- **It stays below yield across the whole bracket** — worst case 0.42 of yield,
-  because a dried strap is both more highly stressed *and* roughly twice as
-  strong as the same strap wet. A single drying excursion does not, on these
-  numbers, yield the polymer.
+Both figures already ignore the steel band. If the band is real and bonded it
+would carry about **98 %** of the tension, making K roughly **56× smaller**
+still. Every "does not propagate" verdict here has a large margin behind it.
 
-#### This depends entirely on the stress-free state
+### Longitudinal crack: it cannot even open
 
-A linear-elastic model has one fixed stress-free state. If the strap is
-stress-free as moulded, drying can only return the stress to zero — never past
-it, so constrained shrinkage tension does not exist. The tension above requires
-the stress-free state to have **migrated toward the conditioned moisture**,
-which is what happens physically when a polymer is held at constant strain at
-20–30 MPa for weeks (viscoelastic relaxation), or when it has already yielded
-in compression.
+The FE model measures the opening between the two crack faces directly rather
+than assuming anything. For a crack running hole-to-hole it finds the faces
+**overlapping** at every length below 2.89 mm — they are being pressed
+together, because that crack plane sits in the hole's compressive lobe. A
+linear model has no contact to stop them, and that interpenetration is the
+signature of closure.
 
-`--relaxation` brackets the two readings, and the run prints the span:
+Past 2.89 mm the tip has reached far enough across the ligament to feel the
+*next* hole's tensile lobe and the crack cracks open slightly, but peak K over
+the whole sweep is **1.23 MPa·√mm** against a toughness of 94.9 — a factor of
+**77** below. Pulling harder does not change that ratio: both scale with load.
 
-| `--relaxation` | stress-free moisture | peak tension | reading |
-|---|---|---|---|
-| 0.0 | 0.0000 | +2.4 MPa | purely elastic; drying only unloads |
-| 0.5 | 0.0125 | +17.0 MPa | partially relaxed |
-| **1.0** (default for desorption) | 0.0250 | **+31.6 MPa** | fully relaxed at the conditioned state |
+### What that leaves
 
-Nothing in this repository can settle which row is right. Hole-drilling
-residual strain on a conditioned sample would measure it directly. It is
-verification item #1.
+Static overload is ruled out. What is not:
 
-### Moisture cycling — a stress cycle with no load cycle
-
-The two cases are two halves of one excursion, so the run combines them:
-
-| | low corner | nominal | high corner |
-|---|---|---|---|
-| peak tension (dried) | +18.3 MPa | **+31.6 MPa** | +50.9 MPa |
-| peak compression (wet) | −16.6 MPa | **−31.1 MPa** | −53.7 MPa |
-| stress range | 34.9 MPa | **62.8 MPa** | 104.6 MPa |
-| R = σ_min/σ_max | −0.91 | **−0.98** | −1.06 |
-| amplitude ÷ UTS | 0.18–0.23 | **0.33–0.42** | 0.55–0.70 |
-
-**A wet/dry cycle swings the hole edge through essentially fully reversed
-loading at a third to a half of tensile strength, with the mechanical duty
-cycle completely unchanged.** Unfilled PA66's fully-reversed fatigue strength
-at 10⁶ cycles is typically 20–30 % of UTS, so the nominal and high corners sit
-in or above the finite-life band; only the low corner is marginal. A fatigue
-assessment that counts ratchet-tightening cycles would miss this entirely.
-
-Two caveats that matter as much as the number:
-
-- **Cycle counting must come off the hole wall, not the bulk.** The bulk takes
-  ~9 days to go half way through a moisture change, so bulk wet/dry cycles are
-  seasonal and few. The hole wall equilibrates in hours. The hole edge is
-  simultaneously the most highly stressed location and the fastest-cycling one,
-  and counting off the bulk time constant would under-count by orders of
-  magnitude.
-- **This is not a fatigue analysis.** No cycle counting, no S-N or Paris-law
-  data for the grade at the right moisture state, no frequency or temperature
-  effects, no hysteretic self-heating, no crack-growth model. The stress range
-  is an elastic single-excursion result: it says a cyclic driver exists and
-  roughly how big it is, not how long the part lasts. Sizing that is Tier 3.
-
-### Still unresolved
-
-Two other routes to a crack driver remain open and are outside what this model
-can settle:
-
-1. **Compressive yielding and ratcheting.** At the high bracket corner the
-   hole-edge von Mises stress reaches 1.42 × yield during absorption (0.42 × at
-   the low corner — the conclusion flips across the literature range). Yielding
-   in compression locks in plastic strain that reappears as tension on drying,
-   and would push the stress-free state toward full relaxation by itself. Needs
-   plasticity and a cyclic moisture history — Tier 3.
-2. **Through-thickness gradients.** This is a membrane model fed a
-   thickness-averaged concentration, so it is blind to the drying skin pulled
-   into tension over a still-wet core — the classic moisture-driven surface
-   cracking mechanism in polyamides. A low tensile stress here is **not**
-   evidence that moisture is harmless.
-
-### One more Tier 2 result worth knowing
-
-The steel band *suppresses* differential-swelling tension. A wetted ring around
-a hole produces ~11.5 MPa of tension in the surrounding dry polymer with no
-band, but only ~0.3 MPa with it: the band is ~25× stiffer per unit width, so it
-reacts the mismatch itself. The band makes the *uniform* constrained-swelling
-compression worse and the *gradient* tension better.
-
----
-
-## Tier structure
-
-| Tier | Question | Cost | Status |
-|---|---|---|---|
-| **1** | Is any mechanism close enough to strength to be worth modelling? | seconds, numpy only | built, tested |
-| **2** | Do the holes interact, and what does the transient moisture field actually do? | ~20 s per case | built, tested |
-| **3** | Plasticity, cyclic moisture, through-thickness gradients, fatigue | not started | [scoped below](#what-this-model-cannot-do--tier-3-scope) |
-
-Tier 1 is deliberately independent of Tier 2 — it needs no FE stack — and Tier 2
-is [cross-checked against it](#cross-checks-and-verification) on every run.
+1. **Which way the crack actually runs.** If it really is hole-to-hole, ratchet
+   tension is not the driver at all, and the mechanism has to be something this
+   model does not contain — bearing load from the ratchet pawl pressing on the
+   hole edge, bending or twisting around the buckle, residual stress from
+   moulding, or an environmental mechanism. **Measuring the crack direction on
+   the failed part is the single highest-value thing to do next**, because it
+   decides which of two completely different investigations is the right one.
+2. **Fatigue.** A crack that will not run in one pull can still grow a little
+   on every pull. Needs S-N or Paris-law data for the grade, and a duty cycle.
+3. **Creep crack growth** under sustained tension, which a monotonic K_IC says
+   nothing about.
+4. **Environmental attack** — a chemical or UV mechanism that lowers the
+   effective toughness far below the bracket used here.
 
 ---
 
 ## Units
 
-One consistent system throughout. There is no unit conversion anywhere in the
-code, because there is nothing to convert.
+One consistent system. The single exception is documented and isolated.
 
 | quantity | unit |
 |---|---|
 | length | mm |
 | force | N |
 | stress, modulus | MPa (N/mm²) |
-| time | s |
-| diffusivity | mm²/s |
-| moisture content | dimensionless mass fraction (kg water / kg dry polymer) |
-| coefficient of moisture expansion | linear strain per unit mass fraction |
+| **stress intensity, K** | **MPa·√mm** |
+| J-integral | N/mm |
 
-Diffusivity is the trap: literature quotes water in PA66 as 10⁻¹³–10⁻¹² m²/s,
-which is **10⁻⁷–10⁻⁶ mm²/s**. A slip here moves every predicted time by 10⁶.
+**The one conversion.** K_IC brackets in `materials.py` are stored in
+**MPa·√m**, because that is what every datasheet and paper quotes, and a
+bracket nobody can read against a datasheet is a bracket nobody will maintain.
+`materials.fracture_toughness_mpa_root_mm()` is the only place the two meet:
+
+```
+1 MPa·√m = √1000 MPa·√mm = 31.6228 MPa·√mm
+```
+
+Getting that factor wrong scales every fracture margin in the study by 31.6,
+which is why it is a named function with a test on it rather than a
+multiplication scattered through the code.
 
 ---
 
 ## Installation
 
-Tier 1 needs only numpy and scipy. Tier 2 additionally needs an FE stack.
+The handbook screen needs only numpy and scipy. The FE model needs a mesher and
+a solver.
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -e ".[tier2,dev]"      # or: pip install -r requirements.txt
+pip install -e ".[fe,dev]"      # or: pip install -r requirements.txt
 ```
 
 ### gmsh needs system libraries even when headless
@@ -242,60 +180,39 @@ sudo apt-get install -y libglu1-mesa libxft2 libxinerama1 \
                         libxcursor1 libxrender1 libxfixes3 libfontconfig1
 ```
 
-`mesh.build_strip_mesh` catches this and says exactly which packages are
-missing. The test suite detects it and skips every gmsh-dependent test
-automatically (`-m "not requires_gmsh"` does the same on demand), so the rest
-of the suite still runs on a machine without them.
+`mesh.build_strip_mesh` catches this and names the missing packages. The test
+suite detects it and skips every gmsh-dependent test automatically.
 
 ---
 
 ## Running it
 
-### Tier 1 — closed-form screening
+### Handbook screen — seconds, no FE stack
 
 ```bash
-python scripts/run_tier1_analytical.py                 # all bracket corners
-python scripts/run_tier1_analytical.py --corner high
-python scripts/run_tier1_analytical.py --tension 800 --hole-diameter 4.6
+python scripts/run_handbook_screen.py
+python scripts/run_handbook_screen.py --condition dry      # brittlest state
+python scripts/run_handbook_screen.py --tension 2000
+python scripts/run_handbook_screen.py --observed-crack 3.5
 ```
 
-### Tier 2 — coupled FE
+### FE sweep
 
 ```bash
-python scripts/run_tier2_fe.py                          # both cases, nominal
-python scripts/run_tier2_fe.py --quick                  # ~15 s pipeline check
-python scripts/run_tier2_fe.py --corner high            # bracket corner
-python scripts/run_tier2_fe.py --case desorption        # drying only
-python scripts/run_tier2_fe.py --relaxation 0           # purely elastic reference
-python scripts/run_tier2_fe.py --mesh-convergence       # Kt convergence only
+python scripts/run_lefm_sweep.py                      # both orientations, ~21 s
+python scripts/run_lefm_sweep.py --quick              # coarse smoke test
+python scripts/run_lefm_sweep.py --orientation transverse
+python scripts/run_lefm_sweep.py --condition dry
+python scripts/run_lefm_sweep.py --convergence        # mesh convergence only
 ```
 
-`--case` defaults to `both`, because the tensile and compressive halves of a
-moisture cycle come from different excursions and only mean something together.
-
-| case | excursion | stress-free reference | sign at the hole edge |
-|---|---|---|---|
-| `absorption` | as-moulded → saturated | as-moulded (nothing to relax to) | compressive |
-| `desorption` | 50 % RH equilibrium → as-moulded | conditioned state (`--relaxation 1`) | **tensile** |
-
-`--relaxation` (0 to 1) sets what fraction of the starting equilibrium moisture
-the polymer is taken to be stress-free at; `--stress-free-moisture` sets the
-value directly and overrides it.
-
-Outputs land in `results/<case>/`:
+Outputs land in `results/<orientation>/`:
 
 | file | what it shows |
 |---|---|
-| `hole_stress_vs_time.png` | peak principal stress at every hole edge against time (log) |
-| `stress_vs_uptake.png` | hole-edge stress and yield utilisation against moisture uptake |
-| `tier1_cross_check.png` | the three Tier 1 ↔ Tier 2 comparisons |
-| `moisture_cycle.png` | both excursions on one stress axis, with the cycle range and R ratio (written under `desorption/` when both cases run) |
-| `concentration_field.png` | thickness-averaged moisture at peak hole-edge von Mises |
-| `stress_field_max_principal.png`, `stress_field_von_mises.png` | equilibrium PA66 stress |
-| `summary.json` | every headline number, including `peak_tensile` and `moisture_cycle` blocks, for diffing between runs |
-
-Useful flags for isolating one effect at a time: `--no-band`, `--no-tension`,
-`--fixed-modulus`.
+| `k_vs_crack_length.png` | **the headline figure** — FE K(a), the handbook curve over it, and the K_IC band |
+| `crack_opening.png` | flank opening against crack length; below zero means held shut |
+| `summary.json` | every headline number, for diffing between runs |
 
 ---
 
@@ -306,266 +223,215 @@ Useful flags for isolating one effect at a time: `--no-band`, `--no-tension`,
 
 ```python
 PLACEHOLDER_GEOMETRY = StrapGeometry(
-    strap_width=25.0,          # ← measured value here
+    strap_width=25.0,            # ← measured value here
     strap_thickness=3.0,
     hole_diameter=4.0,
     hole_pitch=10.0,
+    observed_crack_length=2.0,   # ← from the hole WALL, not the hole centre
     ...
 )
 ```
 
-…and update the `SOURCES` entry for each one to
-`Provenance.MEASURED`, so it drops out of the verification report.
+…and set that field's `SOURCES` entry to `Provenance.MEASURED`, so it drops out
+of the verification report.
 
-Everything downstream follows automatically, because nothing else holds a
-dimension:
+Everything downstream follows, because nothing else holds a dimension:
 
-- **mesh density** is expressed relative to the hole circumference and the
-  ligament widths, so a measured hole gets the same number of elements round it
-  as the placeholder did;
-- the **modelled window length** and the **end margin** derive from the strap
-  width (one width each end, the St Venant distance — verified empirically:
-  below that the end holes' stress is still moving with the truncation planes);
-- **diffusion time scales** derive from the strap and band thicknesses;
-- **load normalisation** derives from the net section area;
-- **post-processing clearances** derive from the strap thickness.
+- **mesh density** is relative — elements around a hole's circumference,
+  elements along the crack, tip size as a fraction of crack length — so a
+  measured hole gets the same resolution the placeholder did;
+- **the crack** is placed from the hole wall of an interior hole, and the sweep
+  range comes from the ligament available in that direction;
+- the **modelled window length** and **end margin** derive from the strap width
+  (one width each end, the St Venant distance);
+- **load normalisation** derives from the gross section area;
+- the **J-integral contour radii** derive from the distance from the tip to the
+  nearest other free surface.
 
-For a quick one-off without editing source, both scripts take the key
-dimensions on the command line (`--width`, `--thickness`, `--hole-diameter`,
-`--hole-pitch`, `--band-width`, `--band-thickness`, `--tension`). They print a
-reminder to move the values into `geometry.py`.
+For a one-off without editing source, both scripts take the key dimensions on
+the command line (`--width`, `--thickness`, `--hole-diameter`, `--hole-pitch`,
+`--tension`, `--observed-crack`).
 
 `tests/test_geometry.py::TestReparameterisation` and
-`tests/test_mesh.py::TestReparameterisation` exist specifically to catch a
-dimension that has been frozen somewhere internally.
+`tests/test_mesh.py::TestReparameterisation` exist to catch a dimension that
+has been frozen somewhere internally.
 
 ---
 
-## How the Tier 2 model works
+## How the model works
 
-### `mesh.py` — the perforated strip
+### `analytical.py` — handbook solutions
 
-Builds the strap window in gmsh's OCC kernel via pygmsh: a rectangle, fragmented
-along the steel band's footprint so elements conform to the stiffness jump, with
-the perforations subtracted. Boundaries and subdomains are tagged by **position**
-(entity centre of mass and bounding box) rather than by entity number, which
-survives gmsh renumbering entities after a boolean operation.
+Newman's collocation fits (NASA TN D-6376, 1971) for a radial crack from a
+circular hole in an infinite plate under remote tension, with Feddersen's
+secant correction for finite width. Both fits are **exact at both asymptotes**,
+which is what makes them trustworthy enough to check an FE model against:
 
-Named boundaries: `cut_start`, `cut_end` (model truncation planes — *not*
-physical surfaces), `side_lower`, `side_upper` (real free edges), and
-`hole_0 … hole_{n-1}`, each tagged separately so post-processing can report a
-peak stress per hole.
+| | a → 0 | a → ∞ |
+|---|---|---|
+| one crack | 3.39 | **1/√2** — hole + crack behaves as a through crack of length 2r + a |
+| two symmetric cracks | 3.36 | **1** — behaves as a central crack of half-length r + a |
 
-Generated meshes are validated before being returned: all expected boundaries
-present, one tag per hole, meshed area matching rectangle-minus-holes to 2 %,
-and no element straddling the band edge. A silently mis-tagged boundary would
-give a plausible-looking but wrong stress field, which is the worst possible
-outcome for an investigation.
+The short-crack limit is the same for both and has a clean reading: an edge
+crack (1.1215) sitting in the hole's 3σ hoop stress — 1.1215 × 3 = 3.3645.
 
-> **Note:** `skfem.io.meshio` returns *subdomain* indices offset by the
-> preceding line-cell block, so `mesh.subdomains[...]` does not index elements
-> directly. Boundary (facet) tags are unaffected. `band_element_mask()`
-> therefore classifies geometrically from `StrapGeometry` — exact, because the
-> band footprint is a rectangle and the mesh conforms to its edge.
+Also here: `lefm_validity()`, which reports whether a K-based argument is
+admissible at all (see [below](#is-lefm-even-applicable)).
 
-### `diffusion.py` — transient Fickian moisture
+### `mesh.py` — seeding a real crack
 
-Solves `∂c/∂t = D ∇²c` on the mesh by backward Euler on a log-spaced time grid
-(diffusion transients are self-similar in √t; uniform steps would spend almost
-all their effort on the flat tail). The mass matrix is row-sum lumped, which
-restores the discrete maximum principle and keeps the solution bounded and
-monotone despite the discontinuous initial condition.
+A crack is a surface, not a thin slot, so it cannot be cut out of the geometry.
+It is made in three steps:
 
-**The through-thickness correction is the important part.** A plane-stress model
-lives in the mid-plane, so a 2D solve only sees moisture entering through the
-side edges and hole walls — but the strap's two big faces are exposed too, and
-much closer to the interior (≈1.1–1.5 mm against ≈3 mm in-plane). In-plane-only
-would predict the strap wetting through about **seven times too slowly**.
+1. the crack line is **imprinted** onto the plate with an OCC fragment, so mesh
+   edges lie exactly along it;
+2. the mesh is graded down toward the tip;
+3. the nodes along the crack line are **duplicated**, and the elements on one
+   side remapped onto the duplicates — everywhere except the tip, which stays
+   shared. That single connected node is what makes it a crack tip rather than
+   a cut all the way through, and it is checked explicitly.
 
-This is handled exactly, not fudged. For a prism with uniform initial
-concentration and the same fixed concentration on every surface, the Fickian
-solution separates (Crank, *The Mathematics of Diffusion*, §2.5.4):
+The flanks then become ordinary traction-free boundaries with no special
+treatment, which is exactly what a crack is.
 
-```
-(c_s − c) / (c_s − c₀)  =  u_2D(x, y, t) · u_1D(z, t)
-```
+### `mechanics.py` — static plane stress
 
-so the code solves the in-plane problem by FE, evaluates the through-thickness
-plane-sheet solution analytically (short-time √t series below a Fourier number
-of 0.25, long-time exponential series above — both to better than 1e-6 with 20
-terms), and multiplies. Averaging over the thickness leaves exactly what a
-plane-stress model needs.
+One load case, no eigenstrain, no time dependence. P2 (quadratic) vector
+elements, so strain varies linearly within each element — that is what lets a
+crack-tip field converge on a mesh of this density.
 
-The band is treated as impermeable, so the polymer inside its footprint is a
-skin exposed on one face and sealed on the other, which behaves as half a slab
-of twice its depth.
+**The steel band is deliberately not in the model.** Its existence is inferred
+from photographs, not observed, and ignoring it is conservative: a bonded band
+would carry most of the tension and shield the polymer.
+`mechanics.band_load_sharing()` reports how much it would take (≈98 %), so the
+size of that conservatism is visible rather than hidden.
 
-### `mechanics.py` — plane stress with a swelling eigenstrain
+### `fracture.py` — two independent K extractions
 
-The strap is a through-thickness laminate, so rather than model it in 3D the
-section is condensed to a membrane using the **A-matrix of classical laminate
-theory**. Every layer shares the in-plane strain, so
+| | uses | self-check |
+|---|---|---|
+| **J-integral**, domain form | the energy field | J must not depend on which annulus it is evaluated over — measured on every run |
+| **Displacement extrapolation** | crack-flank opening | none, but it uses completely different information from J |
+
+The domain form is written with the crack-direction vector explicit rather than
+in crack-local axes, so both orientations go through the same code with no
+rotation step to get wrong:
 
 ```
-A    = Σ t_k Q_k          (section stiffness)
-N_sw = Σ t_k Q_k ε_sw,k   (section force from the eigenstrain)
+J = ∫_A [ σ_ij ∂u_j/∂x_k d_k − W d_i ] ∂q/∂x_i dA
 ```
 
-with `ε_sw = 0` in the steel, because steel neither absorbs water nor swells.
-That single fact *is* the mechanism.
+For plane stress the flank opening is `COD(r) = (8 K_I / E) √(r/2π)` —
+independent of Poisson's ratio — so `K_I(r)` is constant near the tip and
+extrapolates cleanly to r = 0.
 
-**Ply-level recovery is what matters.** The smeared membrane stress `N/t`
-averages polymer and steel together and cannot be compared to a PA66 strength.
-After solving for the membrane strain the code recovers the polymer's own
-stress, `σ_PA66 = Q_PA66 : (ε − ε_sw)`. In the rigid-constraint limit (`ε → 0`)
-this reduces exactly to Tier 1's `E β Δc / (1 − ν)` — which is
-[cross-checked on every run](#cross-checks-and-verification) and pinned by a
-unit test.
-
-Displacement uses P2 (quadratic) vector elements, so strain varies linearly
-within each element; that is what lets the hole-edge stress converge on a mesh
-of this density. Hole-edge stresses are sampled on the facets themselves rather
-than read from a smoothed nodal field — nodal averaging across a hole edge pulls
-the value toward the interior and systematically under-reports `Kt`.
-
-The polymer modulus is evaluated pointwise from the local concentration, so the
-water that drives the swelling also softens the polymer resisting it. Holding it
-fixed overstates the swelling stress by 2–3× (`--fixed-modulus` to see). The
-same effect makes a moisture cycle asymmetric in a useful way: drying stiffens
-PA66, so the tensile half of a cycle is produced at a higher modulus than the
-compressive half.
-
-`relaxed_stress_free_moisture()` sets the moisture content the eigenstrain is
-measured from. It carries the whole argument about whether drying produces
-tension or merely unloads, and is documented at length in the source.
-
-### `postprocess.py` — extraction, plots, cross-check
-
-Loops the mechanics solve over the stored concentration fields, collects the
-per-hole stress envelope, compares against Tier 1, and reports whether the
-membrane model is even usable at the hole edges (see below).
+**Closure is measured, not assumed.** A linear elastic model has no contact and
+will happily let crack faces interpenetrate, reporting a confident and
+meaningless K. `k_from_opening()` checks the sign of the opening and refuses to
+report a mode I K when the faces overlap. Reversing the load sign flips the
+verdict, which is how the tests confirm it is measuring rather than pattern-
+matching on orientation.
 
 ---
 
 ## Cross-checks and verification
 
-Two independent routes to the same number is the only cheap defence against a
-silently wrong FE model. Every Tier 2 run prints:
+Every FE run prints its own numerical quality, and at the production mesh:
 
-| comparison | expected relationship |
+| check | result |
 |---|---|
-| `Kt` at a hole | FE slightly **below** the Howland/Peterson isolated-hole value — that difference *is* the row-interaction result |
-| constrained swelling stress in the reinforced bulk | FE **≈ equal** to `E β Δc / (1 − ν)`; both solve the same problem there |
-| time to half uptake | FE slightly **faster** than the plane-sheet value, because in-plane ingress adds to it |
+| J-integral domain independence | **0.02 %** across five annuli |
+| J-based K vs displacement-extrapolated K | **< 2 %** apart |
+| FE vs handbook, **isolated** hole | **1 – 6 %** |
+| FE vs handbook, **row of 5 holes** | FE is **13 – 16 % lower** |
+| mesh convergence | **0.03 %** between refinement levels |
 
-Anything outside a factor of 2 is flagged as a disagreement. The comparison uses
-the same bracket corner as the FE run, because the diffusivity bracket spans a
-decade.
+That last row is a result, not an error: the neighbouring holes shield the
+cracked one. The same shielding shows up independently in the uncracked stress
+concentration factor — FE Kt 2.23 against the isolated-hole 2.59, 13.8 % lower
+— which is a satisfying consistency check between two different quantities.
 
-Beyond that, the test suite (**385 tests**) verifies:
+The 298-test suite additionally pins:
 
-- the FE `Kt` against the **Howland/Peterson closed form** for a single hole in
-  a finite-width strip (agrees to 6 %, converged to 0.4 %);
-- the FE diffusion solve against the **analytic plane-sheet series** for a
-  hole-free strip (agrees to 2 %);
-- the short-time and long-time moisture series against **each other** across the
-  branch switch (an easy place to lose a √π);
+- both Newman fits at **both asymptotes**, including the 1.1215 × 3 reading of
+  the short-crack limit;
+- `COD ∝ √r` near the tip — the LEFM signature. If that does not hold, K is not
+  the right parameter and the extraction means nothing;
+- J scaling as load² and K as load;
 - **patch tests** — uniform tension on a plain strip reproduces `F/(W t)` to
-  1e-8; unconstrained swelling produces exactly zero stress; tension and
-  swelling superpose;
-- the rigid-constraint limit reproducing **Tier 1's formula** exactly;
-- that derived geometry actually follows its inputs, so a measured strap
-  re-runs the study unchanged.
+  1e-8, stress is independent of modulus in a statically determinate patch;
+- the `√1000` toughness unit conversion;
+- that a large enough load *does* make the crack propagate, so the "does not"
+  verdict means something.
 
 ```bash
-pytest -q                            # all 385, ~30 s
-pytest -q -m "not requires_gmsh"     # 287 of them, on a machine without gmsh
+pytest -q                            # all 298, ~25 s
+pytest -q -m "not requires_gmsh"     # on a machine without gmsh
 ```
 
-### A limitation the results forced into the open
+### Is LEFM even applicable?
 
-Classical laminate theory enforces the *resultant* traction on a free edge, not
-the traction on each layer, so at a hole wall it lets the polymer and steel
-plies carry equal and opposite self-equilibrating stress. Reality relaxes that
-mismatch to zero through interlaminar shear over a boundary layer roughly one
-laminate thickness wide.
+Reported automatically against whatever dimensions are supplied:
 
-For the placeholder dimensions that boundary layer is ~3 mm against a 6 mm
-inter-hole ligament — a ratio of 0.5, which the code reports as **marginal**.
-The *swelling* component of the hole-edge stress should therefore be read as an
-**upper bound**. The mechanical stress concentration and the reinforced bulk
-stress are unaffected.
+- **Small-scale yielding holds.** The plane-stress plastic zone is 0.03 mm
+  against a 2 mm crack and an 8.5 mm ligament, so K does characterise the tip.
+- **The section is far too thin for plane strain.** ASTM E399 wants
+  2.5(K_IC/σ_y)² ≈ 20 mm; the strap is 3 mm. The part is in **plane stress**,
+  where the effective toughness is higher than the plane-strain K_IC, often by
+  a factor of two or more.
 
-`postprocess.free_edge_validity()` recomputes this against whatever dimensions
-are supplied, so the caveat updates itself when real measurements arrive.
+That second point cuts one way only, and the code says so: comparing against
+K_IC is **conservative**, so a "does not propagate" verdict is *strengthened* by
+it and a "propagates" verdict would not be.
 
 ---
 
 ## Assumptions that still need a physical part
 
-Both entry points print the full table. In priority order, the ones that would
-change a conclusion:
+Both entry points print the full table. In priority order:
 
 | # | Assumption | Why it matters | How to settle it |
 |---|---|---|---|
-| 1 | **How far the stress-free state has relaxed toward the conditioned moisture** (`mechanics.relaxed_stress_free_moisture`) | Largest single lever in the model. Spans +2.4 to +31.6 MPa of hole-edge tension on drying — the difference between "drying only unloads" and "drying is the crack driver" | Hole-drilling residual strain on a conditioned sample; or anneal a sample and measure the dimensional change |
-| 2 | **The holes pierce the steel band** (`geometry.py`) | If the band is instead split or interrupted around the holes, the longitudinal constraint at the hole is released and the mechanism weakens qualitatively | Section through a hole; look for steel at the hole wall |
-| 3 | **A steel band exists, 18 × 0.8 mm** | Its existence is *inferred*, not observed. No band means no constrained swelling at all | Section and etch, X-ray, or a magnet on a scrap length |
-| 4 | **PA66 grade and its properties** | Yield strength brackets span 30–55 MPa; the yielding conclusion flips across them. Glass fill would change everything | Moulder's part record; FTIR + DSC + ash test |
-| 5 | **Diffusivity 1e-7…1e-6 mm²/s** | Spans a decade, so all *timing* is order-of-magnitude only | Gravimetric sorption on a coupon of known thickness; fit √t |
-| 6 | **Swelling coefficient 0.20–0.30** | Multiplies straight through to the swelling stress | Measure a coupon dry and conditioned; strain ÷ mass uptake |
-| 7 | **Strap thickness 3.0 mm** | Time-to-saturation goes as thickness², so a 20 % error is a 44 % error in timing | Micrometer on an unperforated section |
-| 8 | **Service tension 500 N** | Sets the mechanical half of the load case (which is *not* currently governing) | Load cell in line during normal tightening |
-
-Lower-priority items — hole diameter and pitch, band offset, Poisson's ratios —
-are in the printed table with their own verification routes.
+| 1 | **Which way the crack runs** | Decides whether this is a mode I problem at all. Transverse and longitudinal give completely different answers | Look at the failed part under magnification and note the direction relative to the strap axis |
+| 2 | **Observed crack length 2.0 mm** | The K(a) curve is read at this value | Measure from the hole wall to the crack tip |
+| 3 | **PA66 grade and its K_IC** | The toughness bracket spans 3.0–5.5 MPa·√m, and datasheets rarely quote it for polyamides | ASTM D5045 SENB or compact tension on razor-notched specimens, conditioned to the service state |
+| 4 | **Service tension 500 N** | K is linear in it, so the margin scales directly | Load cell in line with the strap during normal tightening |
+| 5 | **Strap thickness 3.0 mm** | Sets the section area and therefore the far-field stress | Micrometer on an unperforated section |
+| 6 | **Hole diameter and pitch** | Set the stress concentration and the hole-to-hole shielding | Pin gauge; calipers centre-to-centre over 10 holes |
+| 7 | **Steel band exists, 18 × 0.8 mm** | Ignoring it is conservative, but if it is real the margins are ~56× larger still | Section and etch, X-ray, or a magnet on a scrap length |
 
 Grep for `VERIFY:` across `src/` to find every assumption flagged in place.
 
 ### Modelling assumptions (not measurements)
 
-- **Fick's law with constant D.** Real PA66 sorption is often slightly
-  non-Fickian and `D` rises with temperature and concentration. The decade-wide
-  bracket dwarfs that error, but it means timing is order-of-magnitude only.
-- **Linear elasticity.** No plasticity, no viscoelasticity, no creep — all three
-  are real in PA66 at these stresses and timescales.
-- **The band is perfectly bonded and impermeable.** A debonded interface would
-  wick moisture along the band far faster than this model allows, which is a
-  qualitatively different and worse case.
-- **Monotonic room-temperature strengths.** The strap is failing under
-  *repeated* use, so the governing limit is more likely fatigue or creep rupture
-  well below yield.
-- **Piecewise-linear modulus vs moisture** through three conditioned states. The
-  real curve is sigmoidal, steepest as the wet Tg crosses room temperature near
-  2–3 % uptake.
+- **Linear elasticity, no plasticity.** Justified here by the small-scale
+  yielding check, but it is a check that could fail at a higher load.
+- **Plane stress.** Right for a 3 mm section, and it means the K_IC comparison
+  is conservative.
+- **The crack is straight, sharp and traction-free**, and grows in its own
+  plane. A real crack in a tough polymer blunts and may turn.
+- **A single crack at one hole.** No interaction with cracks at neighbouring
+  holes, which would raise K.
+- **Monotonic, room-temperature, short-term properties.**
 
 ---
 
-## What this model cannot do — Tier 3 scope
+## What this model cannot do
 
 In the order they would change the answer:
 
-1. **Fatigue under moisture cycling.** Tier 2 now says a fully-reversed stress
-   cycle of 35–105 MPa exists at the hole edge from humidity alone. Turning
-   that into a life needs S-N or crack-growth data for the actual grade at the
-   right moisture state, a realistic humidity history to count cycles from (off
-   the *hole wall* time constant, not the bulk), and the frequency and
-   temperature effects that dominate polymer fatigue.
-2. **Through-thickness moisture gradients.** A membrane model fed a
-   thickness-averaged concentration is blind to a drying skin in tension over a
-   wet core — the classic polyamide surface-cracking mechanism. Needs a 3D or
-   layered through-thickness model.
-3. **Plasticity and moisture ratcheting.** Compressive yielding during wetting
-   locks in plastic strain that reappears as tension on drying, and would drive
-   the stress-free state toward full relaxation on its own. Needs an
-   elastic-plastic model and a cyclic wet/dry history.
-4. **The laminate free-edge boundary layer** at the hole walls (see above) —
-   needs interlaminar shear, so 3D.
-5. **Creep rupture.** Static fatigue under the sustained swelling stress, which
-   a monotonic yield strength says nothing about.
-6. **Fracture mechanics proper.** Once a crack exists, `K`/`J` at the hole edge
-   and a growth law — which is where the "fracture mechanics" in the title
-   eventually has to land.
+1. **Say why the crack keeps growing.** Static LEFM rules overload out; it says
+   nothing about what does. Fatigue crack growth under repeated ratcheting is
+   the obvious next candidate and needs `da/dN` data for the grade.
+2. **Handle a crack driven by anything other than axial tension** — pawl
+   bearing load on the hole edge, bending around the buckle, residual stress.
+   Any of these could open a longitudinal crack that tension cannot.
+3. **Represent the steel band's effect on a crack.** A polymer crack bridged by
+   an intact band is a layered-cracking problem, not a plane-stress one.
+4. **Crack turning, branching or blunting.**
+5. **Large-scale yielding**, if a higher load or a tougher/weaker grade pushes
+   the plastic zone out of the small-scale regime — then J or the essential
+   work of fracture is needed, not K.
 
 ---
 
@@ -574,56 +440,51 @@ In the order they would change the answer:
 ```
 src/ratchet_fea/
   provenance.py    where every number came from, and what would replace it
-  geometry.py      StrapGeometry — all dimensions (PLACEHOLDER)     ┐ Tier 1
-  materials.py     PA66 + steel property brackets (LITERATURE)      │
-  analytical.py    Kt, constrained swelling, Fickian timing         ┘
-  mesh.py          perforated strip mesh via pygmsh/gmsh            ┐
-  diffusion.py     transient Fickian field + product solution       │ Tier 2
-  mechanics.py     plane stress + swelling eigenstrain (CLT)        │
-  postprocess.py   extraction, plots, Tier 1 cross-check            ┘
+  geometry.py      StrapGeometry + CrackGeometry (PLACEHOLDER values)
+  materials.py     PA66 and steel property brackets, including K_IC
+  analytical.py    Kt, Newman crack-from-hole K, LEFM validity     ┐ handbook
+  mesh.py          perforated strip with a seeded crack            ┐
+  mechanics.py     static plane-stress elastic solve               │ FE
+  fracture.py      J-integral, K extraction, crack closure         │
+  postprocess.py   K(a) curve, K_IC comparison, plots              ┘
 scripts/
-  run_tier1_analytical.py
-  run_tier2_fe.py
-tests/             one module per source module, 385 tests
+  run_handbook_screen.py
+  run_lefm_sweep.py
+tests/             one module per source module, 298 tests
 ```
 
-Tier 2 modules are imported lazily from `ratchet_fea/__init__.py`, so Tier 1
-works without scikit-fem, gmsh or matplotlib installed.
+The FE modules are imported lazily from `ratchet_fea/__init__.py`, so the
+handbook screen works without scikit-fem, gmsh or matplotlib installed.
 
 ---
 
 ## Development
 
 ```bash
-pytest -q                            # everything (385 tests, ~30 s)
-pytest -q -m "not requires_gmsh"     # 287, skipping anything needing gmsh
-pytest tests/test_mechanics.py -q    # one module
+pytest -q                            # everything (298 tests, ~25 s)
+pytest -q -m "not requires_gmsh"     # skipping anything needing gmsh
+pytest tests/test_fracture.py -q     # one module
 ```
-
-The `requires_gmsh` marker gates mesh generation only; the patch tests and the
-analytic diffusion verification still need scikit-fem, since they run on
-hand-built meshes.
 
 Conventions worth keeping:
 
 - **No number is hardcoded in the FE code.** Every geometric and material value
-  reaches `mesh`/`diffusion`/`mechanics` through `StrapGeometry` or a
-  `materials` bracket. New inputs go in those two modules with a `Source`
-  recording their provenance, or `Documented.source_for` will raise.
-- **Properties are brackets, not values,** and conclusions are checked at both
+  reaches `mesh`/`mechanics`/`fracture` through `StrapGeometry`,
+  `CrackGeometry` or a `materials` bracket. New inputs go in those modules with
+  a `Source` recording their provenance, or `Documented.source_for` will raise.
+- **Properties are brackets, not values**, and conclusions are checked at both
   ends. Anything that flips between `low` and `high` is a measurement request,
-  not a result.
-- **Flag assumptions in place** with a `VERIFY:` comment as well as in the
-  `SOURCES` table.
+  not a result. Note that the brackets do not share a worst case: **dry PA66 is
+  worst for fracture, wet is worst for yield.**
+- **Flag assumptions in place** with a `VERIFY:` comment as well as in
+  `SOURCES`.
 - **Every new physics path gets an independent check** — a closed form, an
-  analytic series, or a patch test — not just a regression value.
+  asymptote, or a patch test — not just a regression value.
 
-### Provenance history
+### History
 
-Tier 1 (`geometry.py`, `materials.py`, `analytical.py`,
-`run_tier1_analytical.py`) was **reconstructed** to the described interface when
-Tier 2 was built, because the repository was empty at that point. It reproduces
-the Tier 1 conclusions it was specified to have — mechanical load benign,
-constrained swelling reaching yield — but if an earlier Tier 1 exists elsewhere,
-diff the placeholder dimensions and the property brackets against it before
-trusting the absolute numbers.
+This repository previously held a coupled moisture-diffusion / swelling study
+of the same part. That was a different hypothesis and has been removed rather
+than left half-finished alongside this one; `geometry.py` and `materials.py`
+survive from it, with the moisture transport properties stripped out. See the
+git history if that line of investigation is ever picked back up.

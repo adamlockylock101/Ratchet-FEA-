@@ -1,33 +1,62 @@
-"""Tier 1: closed-form screening of the STP-RB-001 strap.
+"""Handbook linear elastic fracture mechanics for the STP-RB-001 strap.
 
-This is the cheap check that decides whether an FE model is worth building.
-It asks two questions:
+Closed-form stress intensity factors for a crack growing out of a perforation,
+so the FE model in :mod:`ratchet_fea.fracture` has something independent to be
+checked against.  Two routes to the same number is the only cheap defence
+against a silently wrong FE model.
 
-1.  Does the *mechanical* service load, concentrated at a perforation, get
-    anywhere near the strength of PA66?
-2.  Does *constrained moisture swelling* against the internal steel band?
+The question
+------------
+A crack has nucleated at a hole edge.  Under the ratchet tension alone, does
+``K`` reach ``K_IC`` at any crack length the part can hold?  If it does, the
+crack runs and the strap fails in one pull.  If it does not, something other
+than static overload is keeping the crack going, and this model has ruled a
+mechanism out rather than found one.
 
-Everything is evaluated across the material brackets in :mod:`materials`, so
-the answer is a range, not a number.  A conclusion that survives both bracket
-corners is worth acting on; one that flips is a measurement request.
+UNITS
+-----
+Everything here is mm / N / MPa, so stress intensity comes out in
+**MPa*sqrt(mm)**.  The material bracket in :mod:`ratchet_fea.materials` is
+stored in MPa*sqrt(m) because that is what datasheets quote; convert with
+:func:`~ratchet_fea.materials.fracture_toughness_mpa_root_mm` before comparing.
+The factor is 31.62, and mixing them up is the fastest way to be wrong by a
+factor of 30.
 
-All formulae here are textbook and are cited in place.  Tier 2
-(:mod:`mesh`, :mod:`diffusion`, :mod:`mechanics`) exists to check the two
-assumptions Tier 1 cannot: that the holes do not interact, and that the
-swelling field is uniform.
+Handbook solutions used
+-----------------------
+Newman's collocation fits for a radial crack (or two symmetric radial cracks)
+from a circular hole in an infinite plate under remote uniaxial tension normal
+to the crack, from NASA TN D-6376 (1971).  Both are exact at both asymptotes,
+which :func:`newman_single_crack_factor` and
+:func:`newman_double_crack_factor` document and the tests pin:
 
-UNITS: mm / N / MPa / s, as everywhere else.
+* ``a -> 0``:  ``F -> 3.36``, an edge crack sitting in the ``3 sigma`` hoop
+  stress at the hole wall (``1.1215 * 3``);
+* ``a -> inf``: the hole stops mattering and the flaw behaves as a plain
+  through crack -- ``F -> 1/sqrt(2)`` for one crack, ``F -> 1`` for two.
+
+Finite width is then handled with Feddersen's secant correction.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import math
+from dataclasses import dataclass
 
-from .geometry import PLACEHOLDER_GEOMETRY, StrapGeometry
+import numpy as np
+
+from .geometry import (
+    PLACEHOLDER_GEOMETRY,
+    CrackGeometry,
+    CrackOrientation,
+    StrapGeometry,
+)
 from .materials import (
-    PA66_MOISTURE,
-    MoistureTransport,
-    pa66_at_moisture,
+    SERVICE_CONDITION,
+    MoistureCondition,
+    PolymerGrade,
+    fracture_toughness_mpa_root_mm,
+    grade_for,
 )
 
 __all__ = [
@@ -35,16 +64,31 @@ __all__ = [
     "kt_gross_from_net",
     "row_interaction_note",
     "net_section_stress",
+    "gross_section_stress",
     "mechanical_peak_stress",
-    "constrained_swelling_stress",
-    "fickian_half_time",
-    "Tier1Case",
-    "Tier1Result",
+    "newman_single_crack_factor",
+    "newman_double_crack_factor",
+    "feddersen_width_correction",
+    "handbook_k",
+    "handbook_k_curve",
+    "critical_crack_length",
+    "LefmValidity",
+    "lefm_validity",
+    "FractureScreen",
     "screen",
 ]
 
 # Validity limit of the Howland/Peterson polynomial below.
 KT_MAX_D_OVER_W = 0.5
+
+#: Free-surface correction for an edge crack, ``1.1215``. The ``a -> 0`` limit
+#: of both Newman fits is this times the hole's ``3 sigma`` hoop stress.
+EDGE_CRACK_FACTOR = 1.1215
+
+
+# ---------------------------------------------------------------------------
+# Stress concentration (uncracked)
+# ---------------------------------------------------------------------------
 
 
 def kt_hole_in_finite_width_strip(d_over_W: float) -> float:
@@ -55,11 +99,12 @@ def kt_hole_in_finite_width_strip(d_over_W: float) -> float:
 
         Kt_net = 3.00 - 3.13 (d/W) + 3.66 (d/W)^2 - 1.53 (d/W)^3
 
-    Valid for ``0 <= d/W <= 0.5``.  It reduces to the classical Kirsch value of
+    Valid for ``0 <= d/W <= 0.5``, reducing to the classical Kirsch value of
     3.0 for an infinitely wide plate.
 
-    ASSUMPTION (checked by Tier 2): a *single* hole in an otherwise plain
-    strip.  The real strap has a row of them.  See :func:`row_interaction_note`.
+    This describes the stress in an UNCRACKED strip. It is what nucleates the
+    crack; once a crack exists, K takes over and Kt stops being the right
+    quantity.
     """
     if not 0.0 <= d_over_W <= KT_MAX_D_OVER_W:
         raise ValueError(
@@ -80,31 +125,42 @@ def row_interaction_note(pitch_over_d: float) -> str:
 
     For holes in a line *parallel* to the loading direction, each hole sits in
     the low-stress lobe of its neighbours, so Kt is slightly *reduced* relative
-    to an isolated hole once the pitch exceeds roughly three diameters.  Below
-    about two diameters the ligaments start to control and the behaviour turns
-    over.
+    to an isolated hole once the pitch exceeds roughly three diameters.
 
-    This is exactly the assumption Tier 2 is built to test, which is why the
-    function returns prose rather than a number: do not put a hand-waved
-    correction factor into a margin.
+    Returns prose rather than a number on purpose: a hand-waved correction
+    factor must not end up inside a margin. The FE model measures it.
     """
     if pitch_over_d < 2.0:
         return (
             f"pitch/d = {pitch_over_d:.2f} is below 2 -- holes are close enough "
             "that the ligaments between them may govern rather than the hole "
-            "edge itself. The single-hole Kt is NOT reliable here; trust Tier 2."
+            "edge itself. The single-hole Kt is NOT reliable here; trust the FE."
         )
     if pitch_over_d < 3.0:
         return (
             f"pitch/d = {pitch_over_d:.2f} -- mild interaction expected. The "
             "single-hole Kt should be within roughly 10% but the sign of the "
-            "correction is not obvious. Tier 2 resolves it."
+            "correction is not obvious. The FE model resolves it."
         )
     return (
         f"pitch/d = {pitch_over_d:.2f} is above 3 -- holes are effectively "
-        "isolated for the mechanical load case and the single-hole Kt should "
-        "hold to a few percent."
+        "isolated and the single-hole Kt should hold to a few percent."
     )
+
+
+# ---------------------------------------------------------------------------
+# Far-field stress
+# ---------------------------------------------------------------------------
+
+
+def gross_section_stress(force: float, geometry: StrapGeometry) -> float:
+    """Remote tensile stress away from the perforations, MPa.
+
+    This is the ``sigma`` that drives K: the handbook solutions are written in
+    terms of the stress that would exist in the plate if the hole were not
+    there, not the concentrated stress at the hole.
+    """
+    return force / geometry.gross_section_area
 
 
 def net_section_stress(force: float, geometry: StrapGeometry) -> float:
@@ -112,69 +168,314 @@ def net_section_stress(force: float, geometry: StrapGeometry) -> float:
     return force / geometry.net_section_area
 
 
-def mechanical_peak_stress(force: float, geometry: StrapGeometry) -> tuple[float, float]:
-    """Peak hole-edge stress under remote tension alone.
+def mechanical_peak_stress(force: float, geometry: StrapGeometry) -> tuple:
+    """Peak hole-edge stress in the UNCRACKED strip, ``(stress, kt_net)``.
 
-    Returns ``(peak_stress, kt_net)`` in MPa and dimensionless.
-
-    ASSUMPTION: the steel band is ignored here, so the whole section is taken as
-    polymer.  This is deliberately conservative for the mechanical case -- a
-    real steel band would carry most of the load and drop the polymer stress by
-    roughly the stiffness ratio.  Tier 2's laminate model includes the band.
+    ASSUMPTION: the steel band is ignored, so the whole section is taken as
+    polymer. Deliberately conservative -- a real bonded band would carry most
+    of the load and drop the polymer stress by roughly the stiffness ratio.
     """
     kt = kt_hole_in_finite_width_strip(geometry.d_over_W)
     return kt * net_section_stress(force, geometry), kt
 
 
-def constrained_swelling_stress(
-    youngs_modulus: float,
-    poisson_ratio: float,
-    swelling_coefficient: float,
-    moisture_change: float,
-    constraint: str = "biaxial",
+# ---------------------------------------------------------------------------
+# Crack from a hole: Newman's fits
+# ---------------------------------------------------------------------------
+
+
+def _hole_parameter(crack_length, hole_radius: float):
+    """``lambda = r / (r + a)``, the variable Newman's fits are written in.
+
+    Runs from 1 at zero crack length (all hole) to 0 for a long crack (the
+    hole has stopped mattering).
+    """
+    a = np.asarray(crack_length, dtype=float)
+    if np.any(a <= 0.0):
+        raise ValueError("crack length must be positive")
+    if hole_radius <= 0.0:
+        raise ValueError("hole radius must be positive")
+    return hole_radius / (hole_radius + a)
+
+
+def newman_single_crack_factor(crack_length, hole_radius: float):
+    """Geometry factor ``F`` for ONE radial crack from a hole, infinite plate.
+
+    ``K = F sigma sqrt(pi a)``, with ``a`` measured from the hole wall.
+
+        F = 0.707 - 0.18 L + 6.55 L^2 - 10.54 L^3 + 6.85 L^4,   L = r/(r+a)
+
+    Asymptotes, both reproduced exactly by the fit and pinned by tests:
+
+    * ``a -> 0`` (``L -> 1``): ``F -> 3.39``. An edge crack in the hole's
+      ``3 sigma`` hoop stress: ``1.1215 * 3 = 3.36``.
+    * ``a -> inf`` (``L -> 0``): ``F -> 0.707 = 1/sqrt(2)``. The hole plus its
+      single crack behave as a through crack of total length ``2r + a``, whose
+      half-length is ``(2r + a)/2 -> a/2``, so ``K -> sigma sqrt(pi a / 2)``.
+
+    This is the configuration of interest: a crack on ONE side of a hole.
+
+    FIT ARTEFACT, documented rather than hidden: being a quartic, the
+    polynomial does not settle onto its asymptote monotonically. Beyond about
+    ``a/r = 20`` it wanders within roughly 1% either side of 0.707 -- slightly
+    above, then about 0.2% below near ``a/r = 50``, then back up. Irrelevant
+    here, since this strap cannot hold a crack past ``a/r ~ 5``, but worth
+    knowing before reusing the fit for a long crack from a small hole.
+    """
+    lam = _hole_parameter(crack_length, hole_radius)
+    return (
+        0.707
+        - 0.18 * lam
+        + 6.55 * lam**2
+        - 10.54 * lam**3
+        + 6.85 * lam**4
+    )
+
+
+def newman_double_crack_factor(crack_length, hole_radius: float):
+    """Geometry factor ``F`` for TWO symmetric radial cracks from a hole.
+
+    ``K = F sigma sqrt(pi a)``, with
+
+        F = 0.5 (3 - m) (1 + 1.243 (1 - m)^3),    m = a/(r+a)
+
+    Asymptotes: ``F -> 3.365`` as ``a -> 0`` (same edge-crack-in-3-sigma limit
+    as the single crack), and ``F -> 1`` as ``a -> inf``, where the hole plus
+    both cracks behave as a central crack of half-length ``r + a``.
+
+    Included because it is the configuration the FE model can be verified
+    against most cleanly: it is symmetric, so a quarter model has no ambiguity
+    about which tip is which.
+    """
+    lam = _hole_parameter(crack_length, hole_radius)
+    m = 1.0 - lam
+    return 0.5 * (3.0 - m) * (1.0 + 1.243 * (1.0 - m) ** 3)
+
+
+def feddersen_width_correction(effective_half_crack, width: float):
+    """Feddersen's secant correction for finite width.
+
+    ``F_w = sqrt(sec(pi c / W))``, where ``c`` is the effective half-crack and
+    ``W`` the full width. Tends to 1 for a small flaw and diverges as the flaw
+    consumes the section, which is the right behaviour: a crack that has eaten
+    the ligament has infinite K.
+
+    APPROXIMATION: for a crack from a hole the effective half-crack is taken as
+    ``r + a``, i.e. the hole and its crack are treated as one central flaw.
+    Exact for two symmetric cracks; conservative for one, because a single
+    crack removes less section than the symmetric pair it is modelled as.
+    """
+    c = np.asarray(effective_half_crack, dtype=float)
+    if width <= 0.0:
+        raise ValueError("width must be positive")
+    if np.any(c <= 0.0):
+        raise ValueError("effective half-crack must be positive")
+    ratio = c / width
+    if np.any(ratio >= 0.5):
+        raise ValueError(
+            "effective half-crack reaches the strip edge; the secant "
+            "correction is singular and LEFM has nothing left to describe"
+        )
+    return np.sqrt(1.0 / np.cos(math.pi * ratio))
+
+
+def handbook_k(
+    crack_length,
+    geometry: StrapGeometry,
+    force: float | None = None,
+    orientation: CrackOrientation = CrackOrientation.TRANSVERSE,
+    symmetric: bool = False,
+    finite_width: bool = True,
+):
+    """Stress intensity factor at the tip of a crack from a hole, MPa*sqrt(mm).
+
+    ``crack_length`` is measured from the hole wall and may be an array.
+
+    Returns 0 for a :attr:`~ratchet_fea.geometry.CrackOrientation.LONGITUDINAL`
+    crack. That is not a missing feature: a crack running along the strap lies
+    in the hole's compressive hoop lobe, its faces are pressed together by the
+    ratchet tension, and a mode I stress intensity factor does not exist for a
+    closed crack. The FE model confirms it by measuring the crack opening
+    directly rather than asserting it.
+    """
+    a = np.asarray(crack_length, dtype=float)
+    force = geometry.service_tension if force is None else force
+
+    if orientation is CrackOrientation.LONGITUDINAL:
+        return np.zeros_like(a)
+
+    sigma = gross_section_stress(force, geometry)
+    factor = (
+        newman_double_crack_factor(a, geometry.hole_radius)
+        if symmetric
+        else newman_single_crack_factor(a, geometry.hole_radius)
+    )
+    k = factor * sigma * np.sqrt(math.pi * a)
+
+    if finite_width:
+        k = k * feddersen_width_correction(
+            geometry.hole_radius + a, geometry.strap_width
+        )
+    return k
+
+
+def handbook_k_curve(
+    geometry: StrapGeometry,
+    force: float | None = None,
+    orientation: CrackOrientation = CrackOrientation.TRANSVERSE,
+    n_points: int = 60,
+    max_fraction: float = 0.9,
+    symmetric: bool = False,
+):
+    """``(a, K)`` over the crack lengths this geometry can hold.
+
+    Stops at ``max_fraction`` of the ligament, because both the secant
+    correction and LEFM itself stop meaning anything as the ligament vanishes.
+    """
+    probe = CrackGeometry(length=1.0, orientation=orientation)
+    limit = geometry.max_crack_length(probe) * max_fraction
+    if limit <= 0:
+        raise ValueError("geometry has no room for a crack in this direction")
+    a = np.linspace(limit / n_points, limit, n_points)
+    return a, handbook_k(a, geometry, force, orientation, symmetric=symmetric)
+
+
+def critical_crack_length(
+    geometry: StrapGeometry,
+    toughness_mpa_root_mm: float,
+    force: float | None = None,
+    orientation: CrackOrientation = CrackOrientation.TRANSVERSE,
+    symmetric: bool = False,
 ) -> float:
-    """Stress produced when swelling is prevented, MPa (magnitude).
+    """Crack length at which ``K`` first reaches ``K_IC``, mm.
 
-    A free strain ``eps = beta * dc`` that is fully prevented produces
-
-        uniaxial   sigma = E eps                 (restrained in one direction)
-        biaxial    sigma = E eps / (1 - nu)      (restrained in-plane, free through thickness)
-        triaxial   sigma = E eps / (1 - 2 nu)    (restrained in all three directions)
-
-    For this strap, ``biaxial`` is the right default: the steel band restrains
-    the polymer in the strap plane but nothing restrains the free faces, so the
-    part thickens instead.
-
-    SIGN CONVENTION: the returned value is a magnitude.  During *absorption*
-    the constrained stress is COMPRESSIVE -- which on its own does not crack a
-    polymer.  It is during *desorption* (drying out between uses, or a wet skin
-    drying over a still-wet core) that the same magnitude appears in TENSION.
-    That asymmetry is why Tier 2 runs both directions.
+    ``nan`` if K never reaches the toughness anywhere the part can hold a
+    crack -- which is the interesting answer, because it means static overload
+    does not explain the failure.
     """
-    free_strain = swelling_coefficient * moisture_change
-    if constraint == "uniaxial":
-        factor = 1.0
-    elif constraint == "biaxial":
-        factor = 1.0 / (1.0 - poisson_ratio)
-    elif constraint == "triaxial":
-        if poisson_ratio >= 0.5:
-            raise ValueError("triaxial constraint is singular at nu = 0.5")
-        factor = 1.0 / (1.0 - 2.0 * poisson_ratio)
-    else:
-        raise ValueError(f"unknown constraint mode {constraint!r}")
-    return abs(youngs_modulus * free_strain * factor)
+    a, k = handbook_k_curve(
+        geometry, force, orientation, n_points=4000, symmetric=symmetric
+    )
+    if not np.any(k >= toughness_mpa_root_mm):
+        return float("nan")
+    # K rises monotonically over this range, so a simple interpolation on the
+    # first crossing is exact enough.
+    index = int(np.argmax(k >= toughness_mpa_root_mm))
+    if index == 0:
+        return float(a[0])
+    return float(
+        np.interp(toughness_mpa_root_mm, [k[index - 1], k[index]], [a[index - 1], a[index]])
+    )
 
 
-def fickian_half_time(half_thickness: float, diffusivity: float) -> float:
-    """Time for a slab to reach half its equilibrium moisture uptake, s.
+# ---------------------------------------------------------------------------
+# Is LEFM even applicable?
+# ---------------------------------------------------------------------------
 
-    From the standard plane-sheet solution (Crank, *The Mathematics of
-    Diffusion*, eq. 4.18): ``M_t/M_inf = 0.5`` at ``D t / h^2 = 0.19685``,
-    where ``h`` is the HALF-thickness for a sheet exposed on both faces.
+
+@dataclass(frozen=True)
+class LefmValidity:
+    """Whether a K-based argument is admissible for this part at all.
+
+    LEFM assumes the crack-tip plastic zone is small compared with the crack,
+    the ligament and the thickness. Unfilled PA66 at room temperature is a
+    tough, ductile polymer in a 3 mm section: that assumption is not obviously
+    satisfied, and saying so is part of the answer rather than a disclaimer.
     """
-    if diffusivity <= 0.0:
-        raise ValueError("diffusivity must be positive")
-    return 0.19685 * half_thickness**2 / diffusivity
+
+    crack_length: float
+    ligament: float
+    thickness: float
+    yield_strength: float
+    toughness_mpa_root_mm: float
+    k_applied: float
+
+    @property
+    def plastic_zone_plane_stress(self) -> float:
+        """Irwin plane-stress plastic zone radius at the applied K, mm."""
+        return (1.0 / (2.0 * math.pi)) * (self.k_applied / self.yield_strength) ** 2
+
+    @property
+    def plastic_zone_plane_strain(self) -> float:
+        return (1.0 / (6.0 * math.pi)) * (self.k_applied / self.yield_strength) ** 2
+
+    @property
+    def astm_characteristic_size(self) -> float:
+        """``2.5 (K_IC/sigma_y)^2`` -- ASTM E399's size requirement, mm.
+
+        Crack length, ligament AND thickness must all exceed it for a measured
+        K_IC to be a valid plane-strain material property.
+        """
+        return 2.5 * (self.toughness_mpa_root_mm / self.yield_strength) ** 2
+
+    @property
+    def thickness_is_plane_strain(self) -> bool:
+        return self.thickness >= self.astm_characteristic_size
+
+    @property
+    def small_scale_yielding(self) -> bool:
+        """Plastic zone under an eighth of both the crack and the ligament."""
+        smallest = min(self.crack_length, self.ligament)
+        return self.plastic_zone_plane_stress <= smallest / 8.0
+
+    @property
+    def verdict(self) -> str:
+        if self.small_scale_yielding and self.thickness_is_plane_strain:
+            return "valid"
+        if self.small_scale_yielding:
+            return "plane-stress"
+        return "invalid"
+
+    def message(self) -> str:
+        lines = [
+            f"Plastic zone (plane stress) {self.plastic_zone_plane_stress:.3f} mm "
+            f"against a {self.crack_length:.2f} mm crack and a "
+            f"{self.ligament:.2f} mm ligament.",
+            f"ASTM E399 size requirement 2.5(K_IC/sigma_y)^2 = "
+            f"{self.astm_characteristic_size:.1f} mm, against a "
+            f"{self.thickness:.1f} mm section.",
+        ]
+        if self.verdict == "valid":
+            lines.append("LEFM is applicable and the section is thick enough for K_IC.")
+        elif self.verdict == "plane-stress":
+            lines.append(
+                "Small-scale yielding holds, so K is meaningful -- but the "
+                "section is far thinner than the ASTM requirement, so the part "
+                "is in PLANE STRESS. Its effective toughness is higher than the "
+                "plane-strain K_IC, often by a factor of two or more. Comparing "
+                "against K_IC is therefore CONSERVATIVE: a 'no growth' verdict "
+                "is strengthened by it, a 'growth' verdict is not."
+            )
+        else:
+            lines.append(
+                "SMALL-SCALE YIELDING DOES NOT HOLD. The plastic zone is a "
+                "significant fraction of the crack or the ligament, so K does "
+                "not characterise the crack tip and this whole comparison is "
+                "indicative at best. A J-integral or essential-work-of-fracture "
+                "approach is needed to say anything quantitative."
+            )
+        return " ".join(lines)
+
+
+def lefm_validity(
+    crack_length: float,
+    k_applied: float,
+    geometry: StrapGeometry,
+    grade: PolymerGrade | None = None,
+    corner: str = "nominal",
+    orientation: CrackOrientation = CrackOrientation.TRANSVERSE,
+) -> LefmValidity:
+    """Assemble the LEFM applicability check for one crack length."""
+    grade = grade or grade_for(SERVICE_CONDITION)
+    probe = CrackGeometry(length=crack_length, orientation=orientation)
+    return LefmValidity(
+        crack_length=crack_length,
+        ligament=max(geometry.remaining_ligament(probe), 1e-9),
+        thickness=geometry.strap_thickness,
+        yield_strength=grade.yield_strength.at(corner),
+        toughness_mpa_root_mm=fracture_toughness_mpa_root_mm(grade, corner),
+        k_applied=k_applied,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -183,217 +484,149 @@ def fickian_half_time(half_thickness: float, diffusivity: float) -> float:
 
 
 @dataclass(frozen=True)
-class Tier1Case:
-    """One evaluation of the screening check at a chosen bracket corner."""
-
-    label: str
-    corner: str
-    moisture_content: float
-    youngs_modulus: float
-    poisson_ratio: float
-    yield_strength: float
-    tensile_strength: float
-    swelling_coefficient: float
-
-    # Results
-    kt_net: float = 0.0
-    net_stress: float = 0.0
-    mechanical_peak: float = 0.0
-    swelling_stress: float = 0.0
-    combined_peak: float = 0.0
-
-    @property
-    def mechanical_utilisation(self) -> float:
-        """Peak mechanical stress as a fraction of yield."""
-        return self.mechanical_peak / self.yield_strength
-
-    @property
-    def swelling_utilisation(self) -> float:
-        return self.swelling_stress / self.yield_strength
-
-    @property
-    def combined_utilisation(self) -> float:
-        return self.combined_peak / self.yield_strength
-
-
-@dataclass(frozen=True)
-class Tier1Result:
-    """Outcome of the Tier 1 screen, across bracket corners."""
+class FractureScreen:
+    """Handbook LEFM screen across the toughness bracket."""
 
     geometry: StrapGeometry
-    cases: tuple[Tier1Case, ...]
+    condition: MoistureCondition
+    orientation: CrackOrientation
+    force: float
+    gross_stress: float
     kt_net: float
-    kt_gross: float
     row_note: str
-    half_time_seconds: float
-    half_time_bracket: tuple[float, float]
-    in_plane_half_time_seconds: float
-    #: Wetting half-time at each evaluated bracket corner. The diffusivity
-    #: bracket spans a decade, so a cross-check against a Tier 2 run must use
-    #: the SAME corner the FE run used or it will disagree by that decade.
-    half_time_by_corner: dict = field(default_factory=dict)
-
-    def half_time_at(self, corner: str) -> float:
-        """Wetting half-time at a given bracket corner, seconds."""
-        if corner in self.half_time_by_corner:
-            return self.half_time_by_corner[corner]
-        return self.half_time_seconds
-
-    def case(self, label: str, corner: str) -> Tier1Case:
-        for c in self.cases:
-            if c.label == label and c.corner == corner:
-                return c
-        raise KeyError(f"no case {label!r}/{corner!r}")
+    crack_lengths: np.ndarray
+    k: np.ndarray
+    #: ``corner -> K_IC`` in MPa*sqrt(mm).
+    toughness: dict
+    #: ``corner -> critical crack length`` in mm, ``nan`` if never reached.
+    critical_lengths: dict
+    k_at_observed: float
+    observed_crack_length: float
+    validity: LefmValidity
 
     @property
-    def mechanical_alone_is_benign(self) -> bool:
-        """True if mechanical load stays below yield at every bracket corner."""
-        return all(c.mechanical_utilisation < 1.0 for c in self.cases)
+    def max_k(self) -> float:
+        return float(np.max(self.k)) if len(self.k) else 0.0
 
     @property
-    def swelling_is_significant(self) -> bool:
-        """True if constrained swelling reaches yield at any bracket corner.
+    def propagates_at_any_length(self) -> bool:
+        """True if K reaches the weakest toughness anywhere on the curve."""
+        return self.max_k >= min(self.toughness.values())
 
-        This is the Tier 1 finding that justifies building Tier 2.
-        """
-        return any(c.swelling_utilisation >= 1.0 for c in self.cases)
+    @property
+    def propagates_at_observed(self) -> bool:
+        return self.k_at_observed >= min(self.toughness.values())
+
+    def margin_at_observed(self, corner: str = "nominal") -> float:
+        """``K_IC / K`` at the observed crack length. Above 1 means it holds."""
+        if self.k_at_observed <= 0:
+            return float("inf")
+        return self.toughness[corner] / self.k_at_observed
 
     def summary(self) -> str:
         lines = [
-            "TIER 1 SCREENING RESULT",
-            "=======================",
+            "HANDBOOK LEFM SCREEN",
+            "====================",
             "",
-            f"  Kt (net section, single hole)   {self.kt_net:.3f}",
-            f"  Kt (gross section)              {self.kt_gross:.3f}",
-            f"  row interaction                 {self.row_note}",
-            "",
-            "  Through-thickness wetting half-time (Mt/Minf = 0.5):",
-            f"    nominal D  {_fmt_days(self.half_time_seconds)}",
-            f"    bracket    {_fmt_days(self.half_time_bracket[0])} .. "
-            f"{_fmt_days(self.half_time_bracket[1])}",
-            f"  In-plane equivalent half-time    {_fmt_days(self.in_plane_half_time_seconds)}",
-            "    (the smaller of the two governs; if they differ by more than ~5x,",
-            "     the faster path sets the timing and a plane-stress in-plane model",
-            "     alone will MISTIME the result -- see diffusion.py product solution)",
-            "",
-            "  Stress check (MPa), utilisation = peak / yield:",
+            f"  crack orientation     {self.orientation.value} "
+            f"({'mode I under axial tension' if self.orientation.is_mode_i_under_axial_tension else 'PARALLEL to the load'})",
+            f"  hoop stress at mouth  {self.orientation.hole_hoop_stress_factor:+.0f} x far field",
+            f"  material condition    {self.condition.value}",
+            f"  ratchet tension       {self.force:g} N",
+            f"  gross-section stress  {self.gross_stress:.2f} MPa",
+            f"  Kt (uncracked hole)   {self.kt_net:.3f}",
+            f"  row interaction       {self.row_note}",
             "",
         ]
-        header = (
-            f"  {'case':<26} {'E':>7} {'sig_y':>6} {'mech':>7} {'swell':>7} "
-            f"{'comb':>7} {'util':>6}"
-        )
-        lines.append(header)
-        lines.append("  " + "-" * (len(header) - 2))
-        for c in self.cases:
+        if not self.orientation.is_mode_i_under_axial_tension:
+            lines += [
+                "  K IS ZERO FOR THIS ORIENTATION.",
+                "  The crack plane is parallel to the ratchet tension and its mouth",
+                "  sits in the hole's compressive hoop lobe. Axial tension presses",
+                "  the faces together; there is no mode I driving force at any crack",
+                "  length. Static overload cannot run this crack.",
+                "",
+            ]
+            return "\n".join(lines)
+
+        lines += [
+            f"  K at the observed {self.observed_crack_length:g} mm crack:"
+            f" {self.k_at_observed:.1f} MPa*sqrt(mm)",
+            f"  peak K over the whole ligament:  {self.max_k:.1f} MPa*sqrt(mm)",
+            "",
+            f"  {'corner':<10} {'K_IC':>18} {'critical a':>12} {'margin at obs':>14}",
+            "  " + "-" * 58,
+        ]
+        for corner in ("low", "nominal", "high"):
+            kic = self.toughness[corner]
+            critical = self.critical_lengths[corner]
+            critical_text = "never" if math.isnan(critical) else f"{critical:.2f} mm"
             lines.append(
-                f"  {c.label + ' [' + c.corner + ']':<26} "
-                f"{c.youngs_modulus:7.0f} {c.yield_strength:6.1f} "
-                f"{c.mechanical_peak:7.1f} {c.swelling_stress:7.1f} "
-                f"{c.combined_peak:7.1f} {c.combined_utilisation:6.2f}"
+                f"  {corner:<10} {kic:>10.1f} MPa*sqrt(mm) {critical_text:>12} "
+                f"{self.margin_at_observed(corner):>14.2f}"
             )
         lines += [
             "",
-            "  CONCLUSIONS",
-            f"    mechanical load alone stays below yield everywhere: "
-            f"{self.mechanical_alone_is_benign}",
-            f"    constrained swelling reaches yield somewhere:        "
-            f"{self.swelling_is_significant}",
+            "  K_IC units: divide by 31.62 for MPa*sqrt(m).",
+            "",
+            "  LEFM APPLICABILITY",
+            f"  {self.validity.message()}",
         ]
         return "\n".join(lines)
 
 
-def _fmt_days(seconds: float) -> str:
-    days = seconds / 86400.0
-    if days < 1.0:
-        return f"{seconds / 3600.0:.1f} h"
-    if days < 365.0:
-        return f"{days:.1f} d"
-    return f"{days / 365.0:.2f} y"
-
-
 def screen(
     geometry: StrapGeometry | None = None,
-    moisture: MoistureTransport | None = None,
-    corners: tuple[str, ...] = ("low", "nominal", "high"),
-) -> Tier1Result:
-    """Run the Tier 1 screen over the material brackets.
-
-    Two exposure cases are evaluated:
-
-    ``50% RH``      the strap equilibrated to ordinary indoor humidity;
-    ``immersed``    the strap wet through, as it would be if washed, worn
-                    against skin, or used outdoors.
-
-    Both are evaluated at each requested bracket corner.  Moisture-softened
-    modulus and strength are taken from :func:`materials.pa66_at_moisture`, so
-    the softening that partly offsets the swelling is included.
-    """
+    force: float | None = None,
+    orientation: CrackOrientation = CrackOrientation.TRANSVERSE,
+    condition: MoistureCondition = SERVICE_CONDITION,
+    n_points: int = 200,
+) -> FractureScreen:
+    """Run the handbook LEFM screen across the toughness bracket."""
     geometry = geometry or PLACEHOLDER_GEOMETRY
-    moisture = moisture or PA66_MOISTURE
+    force = geometry.service_tension if force is None else force
+    grade = grade_for(condition)
 
-    kt_net = kt_hole_in_finite_width_strip(geometry.d_over_W)
-    kt_gross = kt_gross_from_net(kt_net, geometry.d_over_W)
-    net_sigma = net_section_stress(geometry.service_tension, geometry)
-    mech_peak = kt_net * net_sigma
+    if orientation.is_mode_i_under_axial_tension:
+        a, k = handbook_k_curve(geometry, force, orientation, n_points=n_points)
+        k_obs = float(
+            handbook_k(geometry.observed_crack_length, geometry, force, orientation)
+        )
+    else:
+        probe = CrackGeometry(length=1.0, orientation=orientation)
+        a = np.linspace(
+            geometry.max_crack_length(probe) / n_points,
+            geometry.max_crack_length(probe) * 0.9,
+            n_points,
+        )
+        k = np.zeros_like(a)
+        k_obs = 0.0
 
-    exposures = {
-        "50% RH": moisture.saturation_50rh,
-        "immersed": moisture.saturation_immersed,
-    }
-
-    cases: list[Tier1Case] = []
-    for label, sat_bracket in exposures.items():
-        for corner in corners:
-            dc = sat_bracket.at(corner)
-            beta = moisture.swelling_coefficient.at(corner)
-            E, nu, sy, su = pa66_at_moisture(dc, corner=corner)
-            swell = constrained_swelling_stress(E, nu, beta, dc, constraint="biaxial")
-            # The swelling field is uniform in Tier 1, so it is not amplified by
-            # the hole the way the remote load is -- a uniform equi-biaxial field
-            # has a hoop stress at a hole edge equal to twice the far field for
-            # the in-plane components, but the *difference* from the far field is
-            # what a uniform eigenstrain produces, which for an unconstrained
-            # hole edge is zero. Tier 2 resolves this properly; Tier 1 simply
-            # superposes the magnitudes, which is the conservative reading.
-            combined = mech_peak + swell
-            cases.append(
-                Tier1Case(
-                    label=label,
-                    corner=corner,
-                    moisture_content=dc,
-                    youngs_modulus=E,
-                    poisson_ratio=nu,
-                    yield_strength=sy,
-                    tensile_strength=su,
-                    swelling_coefficient=beta,
-                    kt_net=kt_net,
-                    net_stress=net_sigma,
-                    mechanical_peak=mech_peak,
-                    swelling_stress=swell,
-                    combined_peak=combined,
-                )
-            )
-
-    h_band = geometry.diffusion_half_thickness(in_band_region=True)
-    d_nom = moisture.diffusivity.nominal
-    half_time_by_corner = {
-        corner: fickian_half_time(h_band, moisture.diffusivity.at(corner))
+    toughness = {
+        corner: fracture_toughness_mpa_root_mm(grade, corner)
         for corner in ("low", "nominal", "high")
     }
-    return Tier1Result(
+    critical = {
+        corner: critical_crack_length(geometry, value, force, orientation)
+        for corner, value in toughness.items()
+    }
+
+    return FractureScreen(
         geometry=geometry,
-        cases=tuple(cases),
-        kt_net=kt_net,
-        kt_gross=kt_gross,
+        condition=condition,
+        orientation=orientation,
+        force=force,
+        gross_stress=gross_section_stress(force, geometry),
+        kt_net=kt_hole_in_finite_width_strip(geometry.d_over_W),
         row_note=row_interaction_note(geometry.pitch_over_d),
-        half_time_seconds=fickian_half_time(h_band, d_nom),
-        half_time_bracket=(
-            fickian_half_time(h_band, moisture.diffusivity.high),
-            fickian_half_time(h_band, moisture.diffusivity.low),
+        crack_lengths=a,
+        k=k,
+        toughness=toughness,
+        critical_lengths=critical,
+        k_at_observed=k_obs,
+        observed_crack_length=geometry.observed_crack_length,
+        validity=lefm_validity(
+            geometry.observed_crack_length, k_obs, geometry, grade,
+            orientation=orientation,
         ),
-        in_plane_half_time_seconds=fickian_half_time(
-            geometry.in_plane_diffusion_length, d_nom
-        ),
-        half_time_by_corner=half_time_by_corner,
     )

@@ -1,22 +1,24 @@
 """Material property brackets for STP-RB-001.
 
-UNITS: MPa for stiffness and strength, mm^2/s for diffusivity, dimensionless
-mass fraction for moisture content, and linear strain per unit mass fraction
-for the coefficient of moisture expansion.  See README.md.
+UNITS: MPa for stiffness and strength.  Fracture toughness is stored in
+MPa*sqrt(m), because that is the unit every datasheet and paper quotes it in,
+and a bracket nobody can read against a datasheet is a bracket nobody will
+maintain.  :func:`fracture_toughness_mpa_root_mm` converts it into the
+repository's mm/N/MPa system at the single point of use.  See README.md.
 
 Why brackets and not numbers
 ----------------------------
 Unfilled PA66 is the textbook case of a polymer whose properties are dominated
-by moisture.  Between dry-as-moulded (DAM) and 50% RH conditioned, the modulus
-falls by roughly a factor of two and the yield strength by nearly as much.  At
-water saturation it falls further still.  Quoting a single modulus for "PA66"
-is meaningless, so every property here is a :class:`Bracket` and every
-conclusion is checked at both ends of it.
+by conditioning.  Between dry-as-moulded (DAM) and 50% RH conditioned, the
+modulus falls by roughly a factor of two and the yield strength by nearly as
+much -- while fracture toughness moves the OTHER way, because the absorbed
+water plasticises the amorphous phase and makes the polymer tougher.  Quoting a
+single number for "PA66" is meaningless, so every property here is a
+:class:`Bracket` and every conclusion is checked at both ends of it.
 
-This matters doubly for the moisture-swelling mechanism: the same water that
-drives the swelling eigenstrain also softens the polymer that resists it, and
-the two effects partly cancel.  :func:`pa66_at_moisture` interpolates between
-the conditioned states so the coupling is represented rather than ignored.
+The three conditioning states are NOT a moisture model.  This repository does
+not model moisture.  They are simply the three states the literature reports
+properties at; the service state is 50% RH conditioned.
 
 =============================================================================
 !! NO PROPERTY HERE IS FROM A DATASHEET FOR THE ACTUAL GRADE IN THE PART !!
@@ -29,10 +31,9 @@ a DSC melt point plus ash test) and replace the brackets.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from enum import Enum
-
-import numpy as np
 
 from .provenance import Bracket, Documented, Provenance, Source
 
@@ -41,24 +42,23 @@ __all__ = [
     "ElasticProperties",
     "StrengthProperties",
     "PolymerGrade",
-    "MoistureTransport",
     "PA66_DAM",
     "PA66_RH50",
     "PA66_SATURATED",
-    "PA66_MOISTURE",
-    "STEEL_BAND",
-    "pa66_at_moisture",
-    "pa66_properties",
     "PA66_CONDITIONS",
-    "STEEL_SWELLING_COEFFICIENT",
+    "SERVICE_CONDITION",
+    "STEEL_BAND",
+    "MPA_ROOT_M_TO_MPA_ROOT_MM",
+    "fracture_toughness_mpa_root_mm",
+    "grade_for",
     "all_material_objects",
 ]
 
-
-#: Tolerance below zero that counts as interpolation round-off rather than an
-#: error. Nine orders of magnitude below a realistic moisture content, so it
-#: cannot mask a genuine sign problem.
-_MOISTURE_ROUNDOFF = 1e-9
+#: Fracture toughness unit conversion. K has dimensions stress * sqrt(length),
+#: so changing the length unit from m to mm multiplies K by sqrt(1000) = 31.62.
+#: Getting this wrong scales every fracture margin in the study by 31.6, which
+#: is the easiest available route to a confidently wrong conclusion.
+MPA_ROOT_M_TO_MPA_ROOT_MM = math.sqrt(1000.0)
 
 
 class MoistureCondition(str, Enum):
@@ -79,16 +79,21 @@ class ElasticProperties(Documented):
 
 @dataclass(frozen=True)
 class StrengthProperties(Documented):
-    """Strength limits used to form margins.  Screening only.
+    """Strength and toughness limits used to form margins.  Screening only.
 
     VERIFY: these are short-term, room-temperature, monotonic values.  The
-    strap is failing under repeated use, so the governing limit is more likely
-    a fatigue or static-fatigue (creep rupture) threshold well below yield.
-    Tier 3 should replace these with cyclic data at the right moisture state.
+    strap is failing under repeated use, so the governing limit may well be a
+    fatigue threshold or a static-fatigue (creep rupture) one, both below the
+    monotonic values here.  A crack that will not run under a single pull can
+    still grow a little on every pull.
     """
 
     yield_strength: Bracket
     tensile_strength: Bracket
+    #: Plane-strain fracture toughness, MPa*sqrt(m) -- the unit datasheets use.
+    #: Convert with :func:`fracture_toughness_mpa_root_mm` before comparing
+    #: against anything this repository computes.
+    fracture_toughness: Bracket
 
 
 @dataclass(frozen=True)
@@ -122,20 +127,11 @@ class PolymerGrade(Documented):
     def tensile_strength(self) -> Bracket:
         return self.strength.tensile_strength
 
+    @property
+    def fracture_toughness(self) -> Bracket:
+        """Plane-strain fracture toughness bracket, in MPa*sqrt(m)."""
+        return self.strength.fracture_toughness
 
-
-@dataclass(frozen=True)
-class MoistureTransport(Documented):
-    """Fickian transport and swelling properties for the polymer."""
-
-    #: Fickian diffusivity of water in the polymer at service temperature.
-    diffusivity: Bracket
-    #: Equilibrium uptake in air at 50% RH, mass fraction.
-    saturation_50rh: Bracket
-    #: Equilibrium uptake fully immersed / at 100% RH, mass fraction.
-    saturation_immersed: Bracket
-    #: Coefficient of moisture expansion: linear strain per unit mass fraction.
-    swelling_coefficient: Bracket
 
 
 # ---------------------------------------------------------------------------
@@ -145,6 +141,13 @@ class MoistureTransport(Documented):
 
 _LIT = Provenance.LITERATURE
 _GRADE_CHECK = "Identify the grade (moulder records / FTIR + DSC + ash) and use its datasheet."
+_KIC_CHECK = (
+    "Datasheets rarely quote K_IC for polyamides. Measure it: ASTM D5045 "
+    "SENB or compact tension on razor-notched specimens, conditioned to the "
+    "service state, at the service temperature. Check the validity criteria "
+    "in the standard -- unfilled PA66 often fails them and needs J or the "
+    "essential work of fracture instead."
+)
 
 PA66_DAM = PolymerGrade(
     name="PA66 (unfilled)",
@@ -178,6 +181,18 @@ PA66_DAM = PolymerGrade(
             75.0,
             95.0,
             Source(_LIT, "MPa", "Tensile strength at break, dry as moulded.", _GRADE_CHECK),
+        ),
+        fracture_toughness=Bracket(
+            2.5,
+            4.0,
+            Source(
+                _LIT,
+                "MPa*sqrt(m)",
+                "Dry as moulded. The brittlest state: with no absorbed water "
+                "to plasticise the amorphous phase, PA66 is at its least "
+                "tough. This is the conservative corner for a fracture check.",
+                _KIC_CHECK,
+            ),
         ),
     ),
 )
@@ -215,6 +230,18 @@ PA66_RH50 = PolymerGrade(
             70.0,
             Source(_LIT, "MPa", "Tensile strength, 50% RH conditioned.", _GRADE_CHECK),
         ),
+        fracture_toughness=Bracket(
+            3.0,
+            5.5,
+            Source(
+                _LIT,
+                "MPa*sqrt(m)",
+                "50% RH conditioned -- the service state. Toughness rises with "
+                "conditioning even as strength falls, because the absorbed "
+                "water plasticises the amorphous phase.",
+                _KIC_CHECK,
+            ),
+        ),
     ),
 )
 
@@ -251,64 +278,32 @@ PA66_SATURATED = PolymerGrade(
             60.0,
             Source(_LIT, "MPa", "Tensile strength, water saturated.", _GRADE_CHECK),
         ),
+        fracture_toughness=Bracket(
+            3.5,
+            6.5,
+            Source(
+                _LIT,
+                "MPa*sqrt(m)",
+                "Water saturated. Toughest and most ductile state, and the one "
+                "where a single K_IC number is least meaningful: the crack tip "
+                "yields over a region comparable to the ligament, so LEFM is "
+                "being used outside its validity. See "
+                "analytical.lefm_validity().",
+                _KIC_CHECK,
+            ),
+        ),
     ),
 )
 
-#: Ordered by moisture content -- used by :func:`pa66_at_moisture`.
+#: The three conditioning states, ordered driest first.
 PA66_CONDITIONS = (PA66_DAM, PA66_RH50, PA66_SATURATED)
 
-
-PA66_MOISTURE = MoistureTransport(
-    diffusivity=Bracket(
-        1.0e-7,
-        1.0e-6,
-        Source(
-            _LIT,
-            "mm^2/s",
-            "Water in unfilled PA66 near 23 C (1e-13 .. 1e-12 m^2/s). Spans a "
-            "full decade and is strongly temperature dependent, so the *timing* "
-            "of any result is only good to an order of magnitude. The bracket "
-            "is log-scaled; its nominal is the geometric mean.",
-            "Gravimetric sorption on a coupon of known thickness; fit sqrt(t).",
-        ),
-        scale="log",
-    ),
-    saturation_50rh=Bracket(
-        0.020,
-        0.030,
-        Source(
-            _LIT,
-            "-",
-            "Equilibrium uptake in 50% RH air, mass fraction of dry polymer.",
-            "Weigh a coupon dry, then after conditioning to constant mass.",
-        ),
-    ),
-    saturation_immersed=Bracket(
-        0.075,
-        0.090,
-        Source(
-            _LIT,
-            "-",
-            "Equilibrium uptake fully immersed. Relevant if the strap is worn "
-            "against skin, washed, or used outdoors.",
-            "Immerse a coupon to constant mass at service temperature.",
-        ),
-    ),
-    swelling_coefficient=Bracket(
-        0.20,
-        0.30,
-        Source(
-            _LIT,
-            "1/(mass fraction)",
-            "Linear strain per unit moisture mass fraction. 0.25 means a 2.5% "
-            "mass uptake gives 0.63% linear strain. This is THE parameter the "
-            "swelling mechanism turns on -- it multiplies straight through to "
-            "the constrained-swelling stress.",
-            "Measure a coupon's length dry and conditioned; divide strain by "
-            "mass uptake.",
-        ),
-    ),
-)
+#: The state a belt strap actually lives in. Used as the default everywhere.
+#:
+#: VERIFY: assumes ordinary indoor service. A strap used outdoors, washed, or
+#: worn against skin sits closer to saturated; one kept in a hot dry cab sits
+#: closer to dry-as-moulded, which is also the BRITTLEST state.
+SERVICE_CONDITION = MoistureCondition.RH50
 
 
 # ---------------------------------------------------------------------------
@@ -353,77 +348,42 @@ STEEL_BAND = PolymerGrade(  # reusing the container; it is just an elastic body
             800.0,
             Source(Provenance.LITERATURE, "MPa", "Not used.", "None needed."),
         ),
+        fracture_toughness=Bracket(
+            50.0,
+            200.0,
+            Source(
+                Provenance.LITERATURE,
+                "MPa*sqrt(m)",
+                "Not used. The band is nowhere near fracture, and this model "
+                "does not represent cracks in it.",
+                "None needed.",
+            ),
+        ),
     ),
 )
 
-#: The steel band does not take up water and does not swell.
-STEEL_SWELLING_COEFFICIENT = 0.0
+def grade_for(condition: MoistureCondition = SERVICE_CONDITION) -> PolymerGrade:
+    """The PA66 property set for a conditioning state."""
+    for grade in PA66_CONDITIONS:
+        if grade.condition is condition:
+            return grade
+    raise ValueError(f"no PA66 properties for condition {condition!r}")
 
 
-def pa66_properties(moisture, corner: str = "nominal"):
-    """Vectorised PA66 properties at an array of moisture contents.
+def fracture_toughness_mpa_root_mm(
+    grade: PolymerGrade, corner: str = "nominal"
+) -> float:
+    """Fracture toughness in MPa*sqrt(mm), ready to compare against a computed K.
 
-    Returns ``(E, nu, sigma_y, sigma_u)`` as arrays shaped like ``moisture``,
-    in MPa (dimensionless for Poisson's ratio).  The FE model calls this with
-    the concentration field evaluated at every quadrature point, so it has to
-    be vectorised; :func:`pa66_at_moisture` is the scalar wrapper.
-
-    Values are clamped at both ends rather than extrapolated.  Below the
-    dry-as-moulded state there is no less moisture to have; above saturation
-    the polymer is not absorbing more water, it is doing something else
-    (voiding, hydrolysis) that a linear-elastic model cannot represent anyway.
+    The bracket is stored in MPa*sqrt(m) so it can be read straight off a
+    datasheet. Everything this repository computes is in MPa*sqrt(mm). This is
+    the one place the two meet, so it is the one place the factor of 31.62 can
+    be got wrong -- which is why it is a named function with a test on it
+    rather than a multiplication scattered through the code.
     """
-    c = np.asarray(moisture, dtype=float)
-    # A field that dries all the way to zero reaches exactly 0.0 at its nodes,
-    # and interpolating that onto quadrature points can land a few ulp below
-    # zero -- a P1 basis function evaluated on a facet is not guaranteed to be
-    # non-negative to the last bit. Clamp that away, but still reject anything
-    # negative enough to be a real error rather than round-off.
-    if np.any(c < -_MOISTURE_ROUNDOFF):
-        raise ValueError(
-            f"moisture content cannot be negative (minimum {np.min(c):g})"
-        )
-    c = np.clip(c, 0.0, None)
-
-    knots = sorted(PA66_CONDITIONS, key=lambda g: g.moisture_content)
-    xs = np.array([g.moisture_content for g in knots])
-    # np.interp clamps to the end values outside the knot range, which is the
-    # behaviour we want.
-    return tuple(
-        np.interp(c, xs, np.array([getter(g).at(corner) for g in knots]))
-        for getter in (
-            lambda g: g.youngs_modulus,
-            lambda g: g.poisson_ratio,
-            lambda g: g.yield_strength,
-            lambda g: g.tensile_strength,
-        )
-    )
-
-
-def pa66_at_moisture(
-    moisture: float, corner: str = "nominal"
-) -> tuple[float, float, float, float]:
-    """Interpolate PA66 properties to an arbitrary moisture content.
-
-    Returns ``(youngs_modulus, poisson_ratio, yield_strength, tensile_strength)``
-    in MPa (and dimensionless for Poisson's ratio) at moisture mass fraction
-    ``moisture``, taking each property at the given bracket ``corner``.
-
-    The mechanism under investigation is a competition: more water means more
-    swelling eigenstrain, but also a softer polymer to resist it.  Holding the
-    modulus at its dry value would overstate the swelling stress by 2-3x, so
-    the FE model evaluates the modulus pointwise from the local concentration.
-
-    VERIFY: the interpolation is piecewise linear in mass fraction between the
-    three conditioned states above.  The real modulus-vs-moisture curve is
-    sigmoidal, with the steepest drop as the wet Tg passes room temperature
-    somewhere near 2-3% uptake.  Piecewise linear through the 50% RH point
-    captures the drop crudely but will misplace it if the service temperature
-    is not close to 23 C.
-    """
-    return tuple(float(v) for v in pa66_properties(moisture, corner))  # type: ignore[return-value]
+    return grade.fracture_toughness.at(corner) * MPA_ROOT_M_TO_MPA_ROOT_MM
 
 
 def all_material_objects() -> list:
     """Every material object, for the verification report."""
-    return [PA66_DAM, PA66_RH50, PA66_SATURATED, PA66_MOISTURE, STEEL_BAND]
+    return [PA66_DAM, PA66_RH50, PA66_SATURATED, STEEL_BAND]

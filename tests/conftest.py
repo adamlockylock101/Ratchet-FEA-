@@ -1,9 +1,9 @@
 """Shared fixtures.
 
-Tier 2 fixtures are session-scoped and deliberately coarse: the point of a
-test is to catch a wrong formula or a mis-tagged boundary, not to produce a
-publication-quality stress. Convergence is checked explicitly in
-``test_mechanics.py`` rather than paid for in every test.
+FE fixtures are session-scoped and deliberately coarse: the point of a test is
+to catch a wrong formula or a mis-tagged boundary, not to produce a
+publication-quality K. Convergence is checked explicitly in
+``test_fracture.py`` rather than paid for in every test.
 """
 
 from __future__ import annotations
@@ -12,7 +12,13 @@ from dataclasses import replace
 
 import pytest
 
-from ratchet_fea.geometry import PLACEHOLDER_GEOMETRY, StrapGeometry
+from ratchet_fea.geometry import (
+    PLACEHOLDER_GEOMETRY,
+    CrackGeometry,
+    CrackOrientation,
+    StrapGeometry,
+)
+
 
 def _gmsh_unavailable() -> str:
     """Why gmsh cannot be used here, or an empty string if it can.
@@ -34,7 +40,7 @@ def _gmsh_unavailable() -> str:
 def pytest_configure(config):
     config.addinivalue_line(
         "markers",
-        "requires_gmsh: test needs a working gmsh, so the Tier 1 suite still "
+        "requires_gmsh: test needs a working gmsh, so the handbook suite still "
         "runs where the FE stack is absent",
     )
 
@@ -59,41 +65,52 @@ def geometry() -> StrapGeometry:
 def small_geometry() -> StrapGeometry:
     """A short three-hole window, for tests that need a real mesh but not detail.
 
-    Three is the minimum that has an interior hole, so the interior/end
-    distinction the post-processing relies on is actually exercised. The end
-    margin is deliberately shorter than a full strap width to keep the mesh
-    small; that makes the END holes truncation-affected, which is fine because
-    conclusions are drawn from the interior one.
+    Three is the minimum that has an interior hole, which is where a crack gets
+    seeded. The end margin is deliberately shorter than a full strap width to
+    keep the mesh small.
     """
-    return replace(PLACEHOLDER_GEOMETRY, n_holes=3, end_margin=8.0)
+    return replace(PLACEHOLDER_GEOMETRY, n_holes=3, end_margin=10.0)
 
 
 @pytest.fixture(scope="session")
-def two_hole_geometry() -> StrapGeometry:
-    """A window with no interior hole at all, for the fallback path."""
-    return replace(PLACEHOLDER_GEOMETRY, n_holes=2, end_margin=8.0)
+def isolated_geometry() -> StrapGeometry:
+    """A single-hole strip -- the configuration the handbook solutions describe.
 
-
-@pytest.fixture(scope="session")
-def plain_geometry() -> StrapGeometry:
-    """A single-hole, unreinforced strip -- the configuration Tier 1 describes."""
-    return replace(
-        PLACEHOLDER_GEOMETRY,
-        n_holes=1,
-        steel_band_width=0.0,
-        steel_band_thickness=0.0,
-    )
+    Used to check the FE against the handbook without the row-shielding effect
+    confounding the comparison.
+    """
+    return replace(PLACEHOLDER_GEOMETRY, n_holes=1)
 
 
 @pytest.fixture(scope="session")
 def coarse_controls():
     from ratchet_fea.mesh import MeshControls
 
-    return MeshControls(elements_around_hole=16, min_ligament_divisions=3)
+    return MeshControls(
+        elements_around_hole=16, elements_along_crack=10, min_ligament_divisions=3
+    )
+
+
+@pytest.fixture(scope="session")
+def transverse_crack() -> CrackGeometry:
+    return CrackGeometry(length=2.0, orientation=CrackOrientation.TRANSVERSE)
+
+
+@pytest.fixture(scope="session")
+def longitudinal_crack() -> CrackGeometry:
+    return CrackGeometry(length=2.0, orientation=CrackOrientation.LONGITUDINAL)
 
 
 @pytest.fixture(scope="session")
 def small_strip(small_geometry, coarse_controls):
+    """An uncracked mesh."""
     from ratchet_fea.mesh import build_strip_mesh
 
     return build_strip_mesh(small_geometry, coarse_controls)
+
+
+@pytest.fixture(scope="session")
+def cracked_strip(small_geometry, coarse_controls, transverse_crack):
+    from ratchet_fea.mesh import build_strip_mesh
+
+    return build_strip_mesh(small_geometry, coarse_controls, transverse_crack)

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ratchet-fea"
-version = "0.2.0"
-description = "STP-RB-001: fracture mechanics investigation of a PA66 ratchet belt strap"
+version = "0.3.0"
+description = "STP-RB-001: static LEFM investigation of a cracking PA66 ratchet belt strap"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -14,8 +14,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Tier 2 needs an FE stack; Tier 1 is pure numpy/scipy.
-tier2 = [
+# The FE model needs a mesher and a solver; the handbook screen is pure numpy.
+fe = [
     "scikit-fem>=8.0",
     "meshio>=5.3",
     "pygmsh>=7.1",

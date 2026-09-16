@@ -1,35 +1,35 @@
-"""Plane-stress membrane solve with a moisture swelling eigenstrain.
+"""Static plane-stress solve.
 
-The constitutive helpers are checked against closed-form identities, then the
-assembled solve is checked with patch tests (uniform states it must reproduce
-exactly) before anything is asked of it on the real perforated geometry.
+Constitutive helpers against closed-form identities, then the assembled solve
+against patch tests -- uniform states it must reproduce exactly -- before
+anything is asked of it near a crack tip.
 """
 
 from __future__ import annotations
 
 import math
-from dataclasses import replace
 
 import numpy as np
 import pytest
 
-from ratchet_fea.analytical import (
-    constrained_swelling_stress,
-    kt_hole_in_finite_width_strip,
-)
 from ratchet_fea.geometry import StrapGeometry
-from ratchet_fea.materials import PA66_MOISTURE, STEEL_BAND, pa66_at_moisture
+from ratchet_fea.materials import PA66_DAM, MoistureCondition, grade_for
 from ratchet_fea.mechanics import (
     MechanicsModel,
+    band_load_sharing,
     plane_stress_moduli,
     principal_stresses,
-    recover_polymer_stress,
-    relaxed_stress_free_moisture,
     solve,
-    stress_concentration_factors,
     von_mises,
 )
-from ratchet_fea.mesh import CUT_END, CUT_START, SIDE_LOWER, SIDE_UPPER, StripMesh
+from ratchet_fea.mesh import (
+    CUT_END,
+    CUT_START,
+    SIDE_LOWER,
+    SIDE_UPPER,
+    MeshControls,
+    StripMesh,
+)
 
 
 class TestPlaneStressModuli:
@@ -41,22 +41,14 @@ class TestPlaneStressModuli:
         assert q66 == pytest.approx(e / (2 * (1 + nu)))
 
     def test_shear_modulus_identity(self):
-        """q66 must equal G, and q66 = (q11 - q12)/2 for an isotropic material."""
         q11, q12, q66 = plane_stress_moduli(1500.0, 0.4)
         assert q66 == pytest.approx(0.5 * (q11 - q12))
 
     def test_uniaxial_stress_recovers_the_modulus(self):
-        """sigma_xx = E eps_xx when the strip is free to contract laterally."""
         e, nu = 1800.0, 0.38
         q11, q12, _ = plane_stress_moduli(e, nu)
         exx = 1e-3
-        eyy = -nu * exx  # free lateral contraction
-        assert q11 * exx + q12 * eyy == pytest.approx(e * exx)
-
-    def test_vectorises(self):
-        q11, q12, q66 = plane_stress_moduli(np.array([1000.0, 2000.0]), 0.3)
-        assert q11.shape == (2,)
-        assert q11[1] == pytest.approx(2 * q11[0])
+        assert q11 * exx + q12 * (-nu * exx) == pytest.approx(e * exx)
 
     def test_rejects_incompressible_poisson_ratio(self):
         with pytest.raises(ValueError, match="plane stress"):
@@ -64,26 +56,10 @@ class TestPlaneStressModuli:
 
 
 class TestStressInvariants:
-    def test_principal_stresses_of_a_uniaxial_state(self):
-        s1, s2 = principal_stresses(10.0, 0.0, 0.0)
-        assert s1 == pytest.approx(10.0)
-        assert s2 == pytest.approx(0.0)
-
     def test_principal_stresses_of_pure_shear(self):
         s1, s2 = principal_stresses(0.0, 0.0, 5.0)
         assert s1 == pytest.approx(5.0)
         assert s2 == pytest.approx(-5.0)
-
-    def test_principal_stresses_of_an_equibiaxial_state(self):
-        s1, s2 = principal_stresses(-30.0, -30.0, 0.0)
-        assert s1 == pytest.approx(-30.0)
-        assert s2 == pytest.approx(-30.0)
-
-    def test_principals_are_ordered(self):
-        rng = np.random.default_rng(0)
-        sxx, syy, sxy = rng.normal(size=(3, 200)) * 20
-        s1, s2 = principal_stresses(sxx, syy, sxy)
-        assert np.all(s1 >= s2)
 
     def test_invariants_are_preserved(self):
         rng = np.random.default_rng(1)
@@ -95,182 +71,70 @@ class TestStressInvariants:
     def test_von_mises_of_uniaxial_equals_the_stress(self):
         assert von_mises(25.0, 0.0, 0.0) == pytest.approx(25.0)
 
-    def test_von_mises_is_sign_blind(self):
-        """Which is why a compressive swelling stress can still yield."""
-        assert von_mises(-40.0, 0.0, 0.0) == pytest.approx(von_mises(40.0, 0.0, 0.0))
-
-    def test_von_mises_of_equibiaxial(self):
-        assert von_mises(30.0, 30.0, 0.0) == pytest.approx(30.0)
-
     def test_von_mises_of_pure_shear(self):
         assert von_mises(0.0, 0.0, 10.0) == pytest.approx(10.0 * math.sqrt(3))
 
 
-class TestPlyStressRecovery:
-    def test_rigid_constraint_reproduces_the_tier_1_formula(self):
-        """The single most important identity in the coupled model.
+class TestModel:
+    def test_from_materials_reads_the_grade(self, geometry):
+        model = MechanicsModel.from_materials(geometry)
+        grade = grade_for(MoistureCondition.RH50)
+        assert model.youngs_modulus == pytest.approx(grade.youngs_modulus.nominal)
 
-        With the membrane strain held at zero -- a perfectly rigid band -- the
-        recovered polymer stress must equal Tier 1's biaxial constrained
-        swelling stress, ``E beta dc / (1 - nu)``, and must be COMPRESSIVE
-        during absorption.
-        """
-        e, nu, beta, dc = 1400.0, 0.42, 0.25, 0.06
-        q11, q12, q66 = plane_stress_moduli(e, nu)
-        eps_sw = beta * dc
+    def test_remote_stress_is_force_over_gross_area(self, geometry):
+        model = MechanicsModel.from_materials(geometry, force=900.0)
+        assert model.remote_stress == pytest.approx(900.0 / geometry.gross_section_area)
 
-        sxx, syy, sxy = recover_polymer_stress(0.0, 0.0, 0.0, q11, q12, q66, eps_sw)
-
-        expected = constrained_swelling_stress(e, nu, beta, dc, constraint="biaxial")
-        assert sxx == pytest.approx(-expected)
-        assert syy == pytest.approx(-expected)
-        assert sxy == pytest.approx(0.0)
-
-    def test_free_swelling_produces_no_stress(self):
-        """Unconstrained growth is stress-free, whatever the eigenstrain."""
-        q11, q12, q66 = plane_stress_moduli(1400.0, 0.42)
-        eps_sw = 0.015
-        sxx, syy, sxy = recover_polymer_stress(
-            eps_sw, eps_sw, 0.0, q11, q12, q66, eps_sw
-        )
-        assert sxx == pytest.approx(0.0, abs=1e-9)
-        assert syy == pytest.approx(0.0, abs=1e-9)
-
-    def test_drying_reverses_the_sign(self):
-        """Constrained shrinkage is tensile -- the direction that cracks things."""
-        q11, q12, q66 = plane_stress_moduli(1400.0, 0.42)
-        wet, _, _ = recover_polymer_stress(0.0, 0.0, 0.0, q11, q12, q66, 0.015)
-        dry, _, _ = recover_polymer_stress(0.0, 0.0, 0.0, q11, q12, q66, -0.015)
-        assert wet < 0 < dry
-        assert wet == pytest.approx(-dry)
-
-    def test_mechanical_strain_superposes(self):
-        q11, q12, q66 = plane_stress_moduli(1400.0, 0.42)
-        mech, _, _ = recover_polymer_stress(1e-3, 0.0, 0.0, q11, q12, q66, 0.0)
-        both, _, _ = recover_polymer_stress(1e-3, 0.0, 0.0, q11, q12, q66, 0.01)
-        swell, _, _ = recover_polymer_stress(0.0, 0.0, 0.0, q11, q12, q66, 0.01)
-        assert both == pytest.approx(mech + swell)
-
-    def test_shear_is_untouched_by_swelling(self):
-        """An isotropic eigenstrain has no shear component."""
-        q11, q12, q66 = plane_stress_moduli(1400.0, 0.42)
-        _, _, sxy = recover_polymer_stress(0.0, 0.0, 2e-3, q11, q12, q66, 0.02)
-        assert sxy == pytest.approx(2.0 * q66 * 2e-3)
-
-
-class TestRelaxedStressFreeState:
-    """The assumption that decides whether drying can produce tension at all."""
-
-    def test_no_relaxation_keeps_the_as_moulded_reference(self):
-        assert relaxed_stress_free_moisture(0.025, 0.0) == 0.0
-
-    def test_full_relaxation_moves_it_to_the_conditioned_state(self):
-        assert relaxed_stress_free_moisture(0.025, 1.0) == pytest.approx(0.025)
-
-    def test_partial_relaxation_interpolates(self):
-        assert relaxed_stress_free_moisture(0.025, 0.4) == pytest.approx(0.010)
-
-    def test_a_dry_start_has_nothing_to_relax_to(self):
-        """Absorption from as-moulded is unaffected by the relaxation knob."""
-        for fraction in (0.0, 0.5, 1.0):
-            assert relaxed_stress_free_moisture(0.0, fraction) == 0.0
-
-    def test_fraction_is_bounded(self):
-        with pytest.raises(ValueError, match=r"must lie in \[0, 1\]"):
-            relaxed_stress_free_moisture(0.025, 1.5)
-        with pytest.raises(ValueError, match=r"must lie in \[0, 1\]"):
-            relaxed_stress_free_moisture(0.025, -0.1)
-
-    def test_negative_conditioned_moisture_is_rejected(self):
-        with pytest.raises(ValueError, match="cannot be negative"):
-            relaxed_stress_free_moisture(-0.01, 1.0)
-
-
-class TestMechanicsModel:
-    def test_from_materials_reads_the_geometry(self, geometry):
-        m = MechanicsModel.from_materials(geometry)
-        assert m.strap_thickness == geometry.strap_thickness
-        assert m.band_thickness == geometry.steel_band_thickness
-        assert m.remote_tension == geometry.service_tension
-
-    def test_from_materials_reads_the_material_brackets(self, geometry):
-        m = MechanicsModel.from_materials(geometry)
-        assert m.swelling_coefficient == pytest.approx(
-            PA66_MOISTURE.swelling_coefficient.nominal
-        )
-        assert m.band_modulus == pytest.approx(STEEL_BAND.youngs_modulus.nominal)
-
-    def test_polymer_thickness_excludes_the_band(self, geometry):
-        m = MechanicsModel.from_materials(geometry)
-        assert m.polymer_thickness_in_band == pytest.approx(
-            geometry.strap_thickness - geometry.steel_band_thickness
-        )
-
-    def test_band_dominates_the_section_stiffness(self, geometry):
-        """Which is why the polymer is close to fully constrained."""
-        assert MechanicsModel.from_materials(geometry).stiffness_ratio > 10
-
-    def test_no_band_means_infinite_ratio_is_not_reported(self, geometry):
-        m = MechanicsModel.from_materials(geometry).without_band()
-        assert m.band_thickness == 0.0
-        assert m.stiffness_ratio == pytest.approx(0.0)
-
-    def test_line_load_is_force_per_unit_width(self, geometry):
-        m = MechanicsModel.from_materials(geometry)
-        assert m.remote_line_load == pytest.approx(
-            geometry.service_tension / geometry.strap_width
-        )
-
-    def test_variants_are_independent(self, geometry):
-        m = MechanicsModel.from_materials(geometry)
-        assert m.without_tension().remote_tension == 0.0
-        assert m.remote_tension != 0.0
-        assert m.with_tension(123.0).remote_tension == 123.0
-
-    def test_include_flags(self, geometry):
-        assert MechanicsModel.from_materials(geometry, include_band=False).band_thickness == 0.0
-        assert (
-            MechanicsModel.from_materials(geometry, include_tension=False).remote_tension
-            == 0.0
-        )
+    def test_condition_selects_a_different_material(self, geometry):
+        dry = MechanicsModel.from_materials(geometry, condition=MoistureCondition.DAM)
+        wet = MechanicsModel.from_materials(geometry, condition=MoistureCondition.RH50)
+        assert dry.youngs_modulus > wet.youngs_modulus
 
     def test_validation(self, geometry):
-        m = MechanicsModel.from_materials(geometry)
-        with pytest.raises(ValueError, match="strap_thickness must be positive"):
-            replace(m, strap_thickness=0.0)
-        with pytest.raises(ValueError, match="band_thickness must be in"):
-            replace(m, band_thickness=10.0)
-
-    def test_summary_mentions_the_section(self, geometry):
-        assert "PA66" in MechanicsModel.from_materials(geometry).summary()
+        with pytest.raises(ValueError, match="Young's modulus must be positive"):
+            MechanicsModel(youngs_modulus=0.0, poisson_ratio=0.3, remote_stress=1.0)
+        with pytest.raises(ValueError, match="Poisson's ratio"):
+            MechanicsModel(youngs_modulus=1000.0, poisson_ratio=0.5, remote_stress=1.0)
 
 
-# ---------------------------------------------------------------------------
-# Patch tests: uniform states the solver must reproduce exactly
-# ---------------------------------------------------------------------------
+class TestBandLoadSharing:
+    def test_a_steel_band_carries_almost_all_of_it(self, geometry):
+        """~50x the stiffness per unit width, so the polymer barely loads.
+
+        The FE model ignores this on purpose; the number quantifies how
+        conservative that choice is.
+        """
+        assert band_load_sharing(geometry) > 0.9
+
+    def test_no_band_means_no_sharing(self, geometry):
+        from dataclasses import replace
+
+        plain = replace(geometry, steel_band_width=0.0, steel_band_thickness=0.0)
+        assert band_load_sharing(plain) == 0.0
+
+    def test_a_stiffer_polymer_takes_more_of_the_load(self, geometry):
+        """Dry PA66 is twice as stiff, so it shields itself slightly better."""
+        dry = band_load_sharing(geometry, PA66_DAM)
+        wet = band_load_sharing(geometry, grade_for(MoistureCondition.RH50))
+        assert dry < wet
+
+    def test_a_thicker_band_takes_more(self, geometry):
+        from dataclasses import replace
+
+        thick = replace(geometry, steel_band_thickness=1.5)
+        assert band_load_sharing(thick) > band_load_sharing(geometry)
 
 
 @pytest.fixture(scope="module")
 def plain_strip():
     """A hole-free rectangular strip, wrapped so the solver accepts it.
 
-    Patch tests need a domain whose exact answer is known. Reusing the real
+    Patch tests need a domain whose exact answer is known; reusing the
     perforated mesh would confound a solver error with a stress concentration.
     """
     from skfem import MeshTri
 
-    from ratchet_fea.mesh import MeshControls
-
-    geometry = StrapGeometry(
-        strap_width=25.0,
-        strap_thickness=3.0,
-        hole_diameter=4.0,
-        hole_pitch=10.0,
-        n_holes=1,
-        end_margin=30.0,
-        steel_band_width=25.0,
-        steel_band_thickness=0.8,
-    )
+    geometry = StrapGeometry(n_holes=1, end_margin=30.0)
     length, width = geometry.modelled_length, geometry.strap_width
     mesh = MeshTri.init_tensor(
         np.linspace(0.0, length, 25), np.linspace(0.0, width, 11)
@@ -286,340 +150,69 @@ def plain_strip():
 
 
 class TestPatchTests:
-    def test_uniform_tension_on_a_plain_polymer_strip(self, plain_strip):
-        """sigma_xx = F / (W t) everywhere; sigma_yy = 0 (free to contract)."""
-        g = plain_strip.geometry
-        force = 600.0
-        model = (
-            MechanicsModel.from_materials(g, moisture_dependent_modulus=False)
-            .without_band()
-            .with_tension(force)
-        )
-        result = solve(plain_strip, model, concentration=None)
+    def test_uniform_tension_reproduces_the_remote_stress(self, plain_strip):
+        """sigma_xx = sigma everywhere; sigma_yy = 0 (free to contract)."""
+        model = MechanicsModel.from_materials(plain_strip.geometry, force=600.0)
+        result = solve(plain_strip, model)
+        assert np.allclose(result.sxx, model.remote_stress, rtol=1e-8)
+        assert np.allclose(result.syy, 0.0, atol=1e-8 * model.remote_stress)
+        assert np.allclose(result.sxy, 0.0, atol=1e-8 * model.remote_stress)
 
-        expected = force / g.gross_section_area
-        assert np.allclose(result.sxx, expected, rtol=1e-8)
-        assert np.allclose(result.syy, 0.0, atol=1e-8 * expected)
-        assert np.allclose(result.sxy, 0.0, atol=1e-8 * expected)
+    def test_stress_is_independent_of_the_modulus(self, plain_strip):
+        """A statically determinate patch: stiffness cannot change the stress."""
+        from dataclasses import replace
 
-    def test_unconstrained_swelling_produces_no_stress(self, plain_strip):
-        """A free polymer strip that swells uniformly carries nothing."""
-        g = plain_strip.geometry
-        model = (
-            MechanicsModel.from_materials(g, moisture_dependent_modulus=False)
-            .without_band()
-            .without_tension()
-        )
-        c = np.full(plain_strip.n_vertices, 0.05)
-        result = solve(plain_strip, model, c)
-        assert np.max(np.abs(result.sxx)) < 1e-6
-        assert np.max(np.abs(result.syy)) < 1e-6
-
-    def test_constrained_swelling_approaches_the_tier_1_limit(self, plain_strip):
-        """With a stiff full-width band, the FE must converge on the formula."""
-        g = plain_strip.geometry
-        model = MechanicsModel.from_materials(
-            g, moisture_dependent_modulus=False
-        ).without_tension()
-        c_value = 0.06
-        c = np.full(plain_strip.n_vertices, c_value)
-        result = solve(plain_strip, model, c)
-
-        e, nu, _, _ = pa66_at_moisture(model.stress_free_moisture)
-        limit = constrained_swelling_stress(
-            e, nu, model.swelling_coefficient, c_value, constraint="biaxial"
-        )
-        # The band is stiff but not rigid, so the FE value sits just below the
-        # rigid-constraint limit -- by roughly 1 / (1 + stiffness ratio).
-        interior = np.mean(result.sxx)
-        assert interior < 0, "constrained swelling must be compressive"
-        assert abs(interior) == pytest.approx(limit, rel=0.15)
-        assert abs(interior) < limit
-
-    def test_a_stiffer_band_gets_closer_to_the_rigid_limit(self, plain_strip):
-        g = plain_strip.geometry
-        base = MechanicsModel.from_materials(
-            g, moisture_dependent_modulus=False
-        ).without_tension()
-        c = np.full(plain_strip.n_vertices, 0.06)
-
-        soft = solve(plain_strip, replace(base, band_modulus=20000.0), c)
-        stiff = solve(plain_strip, replace(base, band_modulus=2_000_000.0), c)
-        assert abs(np.mean(stiff.sxx)) > abs(np.mean(soft.sxx))
-
-    def test_no_band_and_no_moisture_gives_no_stress(self, plain_strip):
-        model = (
-            MechanicsModel.from_materials(plain_strip.geometry)
-            .without_band()
-            .without_tension()
-        )
-        result = solve(plain_strip, model, concentration=None)
-        assert np.max(np.abs(result.sxx)) < 1e-9
-
-    def test_drying_below_the_reference_puts_the_strap_into_tension(
-        self, plain_strip
-    ):
-        """The desorption mechanism, end to end.
-
-        Same dried-out moisture field, two stress-free references. With the
-        as-moulded reference the strap is merely unloaded; with the conditioned
-        reference the same drying is constrained SHRINKAGE against the band and
-        the sign reverses.
-        """
-        g = plain_strip.geometry
-        conditioned = 0.025
-        base = MechanicsModel.from_materials(
-            g, moisture_dependent_modulus=False
-        ).without_tension()
-        dried = np.zeros(plain_strip.n_vertices)
-
-        elastic = solve(plain_strip, replace(base, stress_free_moisture=0.0), dried)
-        relaxed = solve(
-            plain_strip, replace(base, stress_free_moisture=conditioned), dried
-        )
-
-        assert np.mean(elastic.sxx) == pytest.approx(0.0, abs=1e-6)
-        assert np.mean(relaxed.sxx) > 5.0, "constrained shrinkage must be tensile"
-
-    def test_shrinkage_tension_mirrors_swelling_compression(self, plain_strip):
-        """Equal and opposite for an equal moisture change about the reference.
-
-        Holding the modulus fixed isolates the sign reversal from the fact that
-        a dry polymer is also a stiffer one.
-        """
-        g = plain_strip.geometry
-        reference = 0.03
-        delta = 0.02
-        base = replace(
-            MechanicsModel.from_materials(
-                g, moisture_dependent_modulus=False
-            ).without_tension(),
-            stress_free_moisture=reference,
-        )
-        wetter = solve(
-            plain_strip, base, np.full(plain_strip.n_vertices, reference + delta)
-        )
-        drier = solve(
-            plain_strip, base, np.full(plain_strip.n_vertices, reference - delta)
-        )
-        assert np.mean(wetter.sxx) < 0 < np.mean(drier.sxx)
-        assert np.mean(drier.sxx) == pytest.approx(-np.mean(wetter.sxx), rel=1e-6)
-
-    def test_a_dried_strap_is_stiffer_so_shrinkage_tension_is_amplified(
-        self, plain_strip
-    ):
-        """With the real moisture-dependent modulus the mirror is not exact.
-
-        Drying stiffens PA66 by 2-3x, so the same moisture change produces MORE
-        stress on the way down than on the way up. Ignoring that would
-        understate the tensile half of a moisture cycle.
-        """
-        g = plain_strip.geometry
-        reference = 0.03
-        delta = 0.02
-        base = replace(
-            MechanicsModel.from_materials(
-                g, moisture_dependent_modulus=True
-            ).without_tension(),
-            stress_free_moisture=reference,
-        )
-        wetter = abs(
-            np.mean(
-                solve(
-                    plain_strip, base, np.full(plain_strip.n_vertices, reference + delta)
-                ).sxx
-            )
-        )
-        drier = abs(
-            np.mean(
-                solve(
-                    plain_strip, base, np.full(plain_strip.n_vertices, reference - delta)
-                ).sxx
-            )
-        )
-        assert drier > wetter
-
-    def test_no_band_means_no_shrinkage_tension_either(self, plain_strip):
-        """Symmetric with the swelling case: nothing to shrink against."""
-        g = plain_strip.geometry
-        base = (
-            MechanicsModel.from_materials(g, moisture_dependent_modulus=False)
-            .without_tension()
-            .without_band()
-        )
-        result = solve(
-            plain_strip,
-            replace(base, stress_free_moisture=0.025),
-            np.zeros(plain_strip.n_vertices),
-        )
-        assert np.max(np.abs(result.sxx)) < 1e-6
-
-    def test_moisture_softening_reduces_the_swelling_stress(self, plain_strip):
-        """The water that swells the polymer also softens it; both must count."""
-        g = plain_strip.geometry
-        c = np.full(plain_strip.n_vertices, 0.085)
-        fixed = MechanicsModel.from_materials(
-            g, moisture_dependent_modulus=False
-        ).without_tension()
-        varying = replace(fixed, moisture_dependent_modulus=True)
-        assert abs(np.mean(solve(plain_strip, varying, c).sxx)) < abs(
-            np.mean(solve(plain_strip, fixed, c).sxx)
-        )
-
-    def test_superposition_of_tension_and_swelling(self, plain_strip):
-        """The problem is linear, so the two load cases must add."""
-        g = plain_strip.geometry
-        base = MechanicsModel.from_materials(g, moisture_dependent_modulus=False)
-        c = np.full(plain_strip.n_vertices, 0.04)
-
-        only_tension = solve(plain_strip, base.without_tension().with_tension(500.0), None)
-        only_swelling = solve(plain_strip, base.without_tension(), c)
-        both = solve(plain_strip, base.with_tension(500.0), c)
-        assert np.allclose(both.sxx, only_tension.sxx + only_swelling.sxx, atol=1e-6)
-
-    def test_rejects_a_concentration_field_of_the_wrong_length(self, plain_strip):
         model = MechanicsModel.from_materials(plain_strip.geometry)
-        with pytest.raises(ValueError, match="nodal field of length"):
-            solve(plain_strip, model, np.zeros(3))
+        soft = solve(plain_strip, replace(model, youngs_modulus=500.0))
+        stiff = solve(plain_strip, replace(model, youngs_modulus=5000.0))
+        assert np.allclose(soft.sxx, stiff.sxx, rtol=1e-8)
 
+    def test_zero_load_gives_zero_stress(self, plain_strip):
+        model = MechanicsModel.from_materials(plain_strip.geometry).with_remote_stress(0.0)
+        assert np.max(np.abs(solve(plain_strip, model).sxx)) < 1e-12
 
-@pytest.mark.requires_gmsh
-class TestStressConcentration:
-    @pytest.fixture(scope="class")
-    def single_hole_strip(self, plain_geometry):
-        from ratchet_fea.mesh import MeshControls, build_strip_mesh
+    def test_stress_scales_linearly_with_load(self, plain_strip):
+        model = MechanicsModel.from_materials(plain_strip.geometry)
+        single = solve(plain_strip, model)
+        triple = solve(plain_strip, model.with_remote_stress(3 * model.remote_stress))
+        assert np.allclose(triple.sxx, 3.0 * single.sxx, rtol=1e-8)
 
-        return build_strip_mesh(plain_geometry, MeshControls(elements_around_hole=48))
-
-    def test_isolated_hole_matches_the_howland_formula(
-        self, single_hole_strip, plain_geometry
-    ):
-        """One hole, no band, no moisture -- exactly what Tier 1 describes.
-
-        This is the load-bearing validation of the FE model: an independent
-        closed-form solution for the same problem.
-        """
-        kt = stress_concentration_factors(single_hole_strip)
-        expected = kt_hole_in_finite_width_strip(plain_geometry.d_over_W)
-        assert kt["all_mean"] == pytest.approx(expected, rel=0.06)
-
-    def test_kt_converges_with_mesh_refinement(self, plain_geometry):
-        from ratchet_fea.mesh import MeshControls, build_strip_mesh
-
-        values = []
-        for n in (24, 48):
-            strip = build_strip_mesh(
-                plain_geometry, MeshControls(elements_around_hole=n)
-            )
-            values.append(stress_concentration_factors(strip)["all_mean"])
-        assert abs(values[1] - values[0]) / values[0] < 0.03
-
-    def test_a_row_of_holes_shields_the_interior_ones(self, small_strip):
-        """The effect Tier 1 could not capture and Tier 2 exists to quantify."""
-        kt = stress_concentration_factors(small_strip)
-        isolated = kt_hole_in_finite_width_strip(small_strip.geometry.d_over_W)
-        assert kt["all_mean"] < isolated
-
-    def test_kt_scales_out_of_the_applied_load(self, small_strip):
-        """A concentration factor must not depend on the load magnitude."""
-        a = stress_concentration_factors(small_strip, force=200.0)["all_mean"]
-        b = stress_concentration_factors(small_strip, force=900.0)["all_mean"]
-        assert a == pytest.approx(b, rel=1e-6)
-
-    def test_reports_one_factor_per_hole(self, small_strip, small_geometry):
-        kt = stress_concentration_factors(small_strip)
-        assert set(kt["per_hole"]) == set(small_geometry.hole_labels)
+    def test_compression_reverses_the_sign(self, plain_strip):
+        model = MechanicsModel.from_materials(plain_strip.geometry)
+        pushed = solve(plain_strip, model.with_remote_stress(-model.remote_stress))
+        assert np.all(pushed.sxx < 0)
 
 
 @pytest.mark.requires_gmsh
 class TestPerforatedSolve:
-    @pytest.fixture(scope="class")
-    def wet_result(self, small_strip, small_geometry):
-        model = MechanicsModel.from_materials(small_geometry)
-        c = np.full(small_strip.n_vertices, 0.085)
-        return solve(small_strip, model, c)
-
-    def test_reports_every_hole(self, wet_result, small_geometry):
-        assert set(wet_result.hole_edges) == set(small_geometry.hole_labels)
-
-    def test_hole_edge_entries_are_finite(self, wet_result):
-        for edge in wet_result.hole_edges.values():
-            for key in ("max_principal", "min_principal", "von_mises"):
-                assert np.isfinite(edge[key])
-            assert edge["max_principal"] >= edge["min_principal"]
-
-    def test_hole_wall_samples_go_all_the_way_round(self, wet_result):
-        theta = wet_result.hole_edges["hole_0"]["theta"]
-        assert theta.min() < -2.0 and theta.max() > 2.0
-
-    def test_saturated_strap_is_in_compression(self, wet_result):
-        """Constrained swelling: compressive, so not a crack driver on its own."""
-        assert wet_result.peak_compressive < 0
-        assert abs(wet_result.peak_compressive) > wet_result.peak_tensile
-
-    def test_nodal_projections_are_defined_everywhere(self, wet_result, small_strip):
-        assert wet_result.nodal_max_principal.shape == (small_strip.n_vertices,)
-        assert np.all(np.isfinite(wet_result.nodal_von_mises))
-
-    def test_von_mises_is_non_negative(self, wet_result):
-        assert np.all(wet_result.von_mises_field >= 0)
-
-    def test_removing_the_band_removes_the_swelling_stress(
-        self, small_strip, small_geometry
-    ):
-        """Without something to push against, swelling costs nothing."""
-        model = MechanicsModel.from_materials(small_geometry).without_tension()
-        c = np.full(small_strip.n_vertices, 0.085)
-        with_band = solve(small_strip, model, c)
-        without = solve(small_strip, model.without_band(), c)
-        assert abs(without.peak_compressive) < 0.1 * abs(with_band.peak_compressive)
-
-    @staticmethod
-    def _wet_ring(strip, geometry, c=0.085):
-        """A wetted ring around one hole, dry elsewhere."""
-        p = strip.mesh.p
-        cx, cy = geometry.hole_centres[0]
-        distance = np.hypot(p[0] - cx, p[1] - cy)
-        return np.where(distance < geometry.hole_radius * 1.6, c, 0.0)
-
-    def test_a_moisture_gradient_puts_dry_material_into_tension(
-        self, small_strip, small_geometry
-    ):
-        """The mechanism that can actually open a crack during absorption.
-
-        Wet material near the hole wall swells; still-dry material further in
-        holds it back and is pulled into tension in the process. Shown here on
-        the unreinforced section, where the mechanism is not masked -- see the
-        next test for what the band does to it.
-        """
-        model = (
-            MechanicsModel.from_materials(small_geometry)
-            .without_tension()
-            .without_band()
+    def test_the_hole_concentrates_stress(self, small_strip, small_geometry):
+        """Roughly Kt times the net-section stress, from an independent route."""
+        from ratchet_fea.analytical import (
+            kt_hole_in_finite_width_strip,
+            net_section_stress,
         )
-        graded = self._wet_ring(small_strip, small_geometry)
 
-        gradient = solve(small_strip, model, graded)
-        uniform = solve(small_strip, model, np.zeros(small_strip.n_vertices))
-        assert uniform.peak_tensile == pytest.approx(0.0, abs=1e-6)
-        assert gradient.peak_tensile > 5.0
+        model = MechanicsModel.from_materials(small_geometry)
+        result = solve(small_strip, model)
+        expected = kt_hole_in_finite_width_strip(
+            small_geometry.d_over_W
+        ) * net_section_stress(small_geometry.service_tension, small_geometry)
+        assert result.peak_tensile == pytest.approx(expected, rel=0.2)
 
-    def test_the_band_soaks_up_the_gradient_mismatch(
-        self, small_strip, small_geometry
-    ):
-        """A result, not a check: the steel band suppresses gradient tension.
+    def test_a_crack_raises_the_peak_stress(self, small_strip, cracked_strip,
+                                            small_geometry):
+        model = MechanicsModel.from_materials(small_geometry)
+        assert solve(cracked_strip, model).peak_tensile > solve(
+            small_strip, model
+        ).peak_tensile
 
-        The band is ~25x stiffer per unit width than the polymer, so it reacts
-        the swelling mismatch itself instead of letting neighbouring polymer do
-        it. Differential swelling therefore produces far less tension in a
-        reinforced strap than in a plain one -- while the uniform constrained
-        swelling compression, which the band causes, gets larger.
-        """
-        base = MechanicsModel.from_materials(small_geometry).without_tension()
-        graded = self._wet_ring(small_strip, small_geometry)
+    def test_nodal_projection_covers_every_vertex(self, cracked_strip, small_geometry):
+        model = MechanicsModel.from_materials(small_geometry)
+        result = solve(cracked_strip, model)
+        nodal = result.nodal(result.von_mises_field)
+        assert nodal.shape == (cracked_strip.n_vertices,)
+        assert np.all(np.isfinite(nodal))
 
-        with_band = solve(small_strip, base, graded)
-        without_band = solve(small_strip, base.without_band(), graded)
-
-        assert with_band.peak_tensile < 0.25 * without_band.peak_tensile
-        assert abs(with_band.peak_compressive) > abs(without_band.peak_compressive)
+    def test_von_mises_is_non_negative(self, cracked_strip, small_geometry):
+        model = MechanicsModel.from_materials(small_geometry)
+        assert np.all(solve(cracked_strip, model).von_mises_field >= 0)

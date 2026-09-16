@@ -13,7 +13,12 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
-from ratchet_fea.geometry import PLACEHOLDER_GEOMETRY, StrapGeometry
+from ratchet_fea.geometry import (
+    PLACEHOLDER_GEOMETRY,
+    CrackGeometry,
+    CrackOrientation,
+    StrapGeometry,
+)
 from ratchet_fea.provenance import Provenance
 
 
@@ -92,33 +97,6 @@ class TestSteelBand:
     def test_band_full_width_detection(self, geometry):
         assert not geometry.band_full_width
         assert replace(geometry, steel_band_width=geometry.strap_width).band_full_width
-
-
-class TestDiffusionGeometry:
-    def test_plain_region_uses_half_the_full_thickness(self, geometry):
-        assert geometry.diffusion_half_thickness(in_band_region=False) == pytest.approx(
-            geometry.strap_thickness / 2
-        )
-
-    def test_band_region_is_a_one_sided_skin(self, geometry):
-        """A layer sealed on one face behaves as half a slab of twice its depth."""
-        assert geometry.diffusion_half_thickness(in_band_region=True) == pytest.approx(
-            geometry.polymer_thickness_in_band / 2
-        )
-
-    def test_the_band_makes_the_polymer_skin_wet_faster(self, geometry):
-        assert geometry.diffusion_half_thickness(True) < geometry.diffusion_half_thickness(False)
-
-    def test_without_a_band_both_regions_agree(self, geometry):
-        plain = replace(geometry, steel_band_thickness=0.0, steel_band_width=0.0)
-        assert plain.diffusion_half_thickness(True) == pytest.approx(
-            plain.diffusion_half_thickness(False)
-        )
-
-    def test_in_plane_length_is_the_shortest_path_to_dry_material(self, geometry):
-        assert geometry.in_plane_diffusion_length == pytest.approx(
-            min(geometry.side_ligament, geometry.inter_hole_ligament / 2)
-        )
 
 
 class TestEndMargin:
@@ -210,7 +188,6 @@ class TestReparameterisation:
         assert measured.modelled_length == pytest.approx(3 * 12.6 + 2 * 31.7)
         assert measured.hole_centres.shape == (4, 2)
         assert measured.polymer_thickness_in_band == pytest.approx(2.4 - 0.55)
-        assert measured.diffusion_half_thickness(False) == pytest.approx(1.2)
 
     def test_geometry_is_immutable_so_a_study_cannot_drift(self, geometry):
         with pytest.raises(Exception):
@@ -249,3 +226,130 @@ class TestProvenanceIsRecorded:
         text = geometry.summary()
         assert "net section" in text
         assert "d/W" in text
+
+
+class TestCrackOrientation:
+    def test_transverse_is_mode_i_under_axial_tension(self):
+        assert CrackOrientation.TRANSVERSE.is_mode_i_under_axial_tension
+
+    def test_longitudinal_is_not(self):
+        """It lies parallel to the load, so tension cannot open it."""
+        assert not CrackOrientation.LONGITUDINAL.is_mode_i_under_axial_tension
+
+    def test_hoop_stress_factors_come_from_the_kirsch_field(self):
+        """+3 sigma at 90 degrees from the load axis, -1 sigma on it."""
+        assert CrackOrientation.TRANSVERSE.hole_hoop_stress_factor == 3.0
+        assert CrackOrientation.LONGITUDINAL.hole_hoop_stress_factor == -1.0
+
+    def test_the_signs_are_opposite(self):
+        """Which is the whole reason the two orientations behave differently."""
+        assert (
+            CrackOrientation.TRANSVERSE.hole_hoop_stress_factor
+            * CrackOrientation.LONGITUDINAL.hole_hoop_stress_factor
+            < 0
+        )
+
+
+class TestCrackGeometry:
+    def test_direction_and_normal_are_perpendicular(self):
+        for orientation in CrackOrientation:
+            crack = CrackGeometry(length=1.0, orientation=orientation)
+            d, n = np.array(crack.direction), np.array(crack.normal)
+            assert d @ n == pytest.approx(0.0)
+            assert np.linalg.norm(d) == pytest.approx(1.0)
+            assert np.linalg.norm(n) == pytest.approx(1.0)
+
+    def test_transverse_runs_across_the_strap(self):
+        assert CrackGeometry(length=1.0).direction == (0.0, 1.0)
+
+    def test_longitudinal_runs_along_it(self):
+        crack = CrackGeometry(length=1.0, orientation=CrackOrientation.LONGITUDINAL)
+        assert crack.direction == (1.0, 0.0)
+
+    def test_side_flips_the_direction(self):
+        assert CrackGeometry(length=1.0, side=-1).direction == (0.0, -1.0)
+
+    def test_length_must_be_positive(self):
+        with pytest.raises(ValueError, match="must be positive"):
+            CrackGeometry(length=0.0)
+
+    def test_side_must_be_plus_or_minus_one(self):
+        with pytest.raises(ValueError, match="must be \\+1 or -1"):
+            CrackGeometry(length=1.0, side=2)
+
+
+class TestCrackPlacement:
+    def test_mouth_sits_on_the_hole_wall(self, geometry):
+        for orientation in CrackOrientation:
+            crack = CrackGeometry(length=2.0, orientation=orientation)
+            mouth = geometry.crack_mouth(crack)
+            centre = geometry.hole_centres[geometry.default_crack_hole()]
+            assert np.hypot(*(mouth - centre)) == pytest.approx(geometry.hole_radius)
+
+    def test_tip_is_one_crack_length_beyond_the_mouth(self, geometry):
+        crack = CrackGeometry(length=2.5)
+        assert np.hypot(
+            *(geometry.crack_tip(crack) - geometry.crack_mouth(crack))
+        ) == pytest.approx(2.5)
+
+    def test_default_hole_is_an_interior_one(self, geometry):
+        index = geometry.default_crack_hole()
+        assert geometry.is_interior_hole(index)
+
+    def test_an_explicit_hole_index_is_honoured(self, geometry):
+        crack = CrackGeometry(length=1.0, hole_index=0)
+        assert geometry.crack_mouth(crack)[0] == pytest.approx(
+            geometry.hole_centres[0][0]
+        )
+
+    def test_an_out_of_range_hole_index_is_rejected(self, geometry):
+        with pytest.raises(ValueError, match="outside"):
+            geometry.crack_mouth(CrackGeometry(length=1.0, hole_index=99))
+
+    def test_transverse_ligament_runs_to_the_free_edge(self, geometry):
+        crack = CrackGeometry(length=1.0)
+        assert geometry.max_crack_length(crack) == pytest.approx(
+            geometry.side_ligament
+        )
+
+    def test_longitudinal_ligament_runs_to_the_next_hole(self, geometry):
+        crack = CrackGeometry(length=1.0, orientation=CrackOrientation.LONGITUDINAL)
+        assert geometry.max_crack_length(crack) == pytest.approx(
+            geometry.inter_hole_ligament
+        )
+
+    def test_remaining_ligament_shrinks_as_the_crack_grows(self, geometry):
+        short = geometry.remaining_ligament(CrackGeometry(length=1.0))
+        long = geometry.remaining_ligament(CrackGeometry(length=4.0))
+        assert short - long == pytest.approx(3.0)
+
+    def test_admissibility(self, geometry):
+        assert geometry.crack_is_admissible(CrackGeometry(length=2.0))
+        assert not geometry.crack_is_admissible(CrackGeometry(length=50.0))
+
+    def test_crack_placement_follows_measured_dimensions(self):
+        """The one-line-update promise, applied to the crack too."""
+        measured = StrapGeometry(
+            strap_width=31.7, hole_diameter=5.1, hole_pitch=12.6, n_holes=3,
+            steel_band_width=20.0,
+        )
+        crack = CrackGeometry(length=1.0)
+        assert measured.max_crack_length(crack) == pytest.approx((31.7 - 5.1) / 2)
+        mouth = measured.crack_mouth(crack)
+        assert mouth[1] == pytest.approx(31.7 / 2 + 5.1 / 2)
+
+
+class TestObservedCrack:
+    def test_is_recorded_and_flagged(self, geometry):
+        assert geometry.observed_crack_length > 0
+        source = geometry.SOURCES["observed_crack_length"]
+        assert source.needs_verification
+        assert "hole edge" in source.verify_by
+
+    def test_it_fits_the_placeholder_geometry(self, geometry):
+        """If it did not, the K(a) curve could not be read at it."""
+        for orientation in CrackOrientation:
+            crack = CrackGeometry(
+                length=geometry.observed_crack_length, orientation=orientation
+            )
+            assert geometry.crack_is_admissible(crack)

@@ -1,8 +1,8 @@
-# Tier 1 (closed-form screening) only needs these:
+# The handbook LEFM screen (scripts/run_handbook_screen.py) needs only these:
 numpy>=1.24
 scipy>=1.10
 
-# Tier 2 (coupled FE) additionally needs:
+# The FE sweep (scripts/run_lefm_sweep.py) additionally needs:
 scikit-fem>=8.0
 meshio>=5.3
 pygmsh>=7.1

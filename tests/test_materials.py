@@ -7,25 +7,32 @@ here propagates into every stress in the study.
 
 from __future__ import annotations
 
-import numpy as np
+import math
+
 import pytest
 
 from ratchet_fea.materials import (
+    MPA_ROOT_M_TO_MPA_ROOT_MM,
     PA66_CONDITIONS,
     PA66_DAM,
-    PA66_MOISTURE,
     PA66_RH50,
     PA66_SATURATED,
+    SERVICE_CONDITION,
     STEEL_BAND,
     MoistureCondition,
     all_material_objects,
-    pa66_at_moisture,
-    pa66_properties,
+    fracture_toughness_mpa_root_mm,
+    grade_for,
 )
 from ratchet_fea.provenance import Provenance
 
 
 class TestBrackets:
+    @pytest.mark.parametrize("grade", PA66_CONDITIONS)
+    def test_toughness_bracket_is_physical(self, grade):
+        assert grade.fracture_toughness.low > 0
+        assert grade.fracture_toughness.high > grade.fracture_toughness.low
+
     @pytest.mark.parametrize("grade", PA66_CONDITIONS)
     def test_elastic_brackets_are_physical(self, grade):
         assert grade.youngs_modulus.low > 0
@@ -36,118 +43,6 @@ class TestBrackets:
     def test_strength_brackets_are_physical(self, grade):
         assert grade.yield_strength.low > 0
         assert grade.tensile_strength.high >= grade.yield_strength.low
-
-    def test_diffusivity_bracket_is_log_scaled(self):
-        """It spans a decade; an arithmetic mean would bias every time scale."""
-        assert PA66_MOISTURE.diffusivity.scale == "log"
-        assert PA66_MOISTURE.diffusivity.spread == pytest.approx(10.0)
-
-    def test_diffusivity_is_in_mm2_per_second(self):
-        """1e-13..1e-12 m^2/s converts to 1e-7..1e-6 mm^2/s.
-
-        A units slip here would move every predicted time by 10^6.
-        """
-        assert PA66_MOISTURE.diffusivity.low == pytest.approx(1e-7)
-        assert PA66_MOISTURE.diffusivity.high == pytest.approx(1e-6)
-
-    def test_immersed_uptake_exceeds_the_50rh_value(self):
-        assert PA66_MOISTURE.saturation_immersed.low > PA66_MOISTURE.saturation_50rh.high
-
-    def test_swelling_coefficient_is_plausible(self):
-        """0.25 per unit mass fraction means 2.5 wt% gives ~0.6% linear strain."""
-        beta = PA66_MOISTURE.swelling_coefficient.nominal
-        assert 0.1 < beta < 0.5
-        assert beta * 0.025 == pytest.approx(0.00625, rel=0.2)
-
-
-class TestMoistureDependence:
-    def test_modulus_falls_with_moisture(self):
-        assert PA66_DAM.youngs_modulus.nominal > PA66_RH50.youngs_modulus.nominal
-        assert PA66_RH50.youngs_modulus.nominal > PA66_SATURATED.youngs_modulus.nominal
-
-    def test_conditioning_roughly_halves_the_modulus(self):
-        """The classic PA66 fact the whole investigation turns on."""
-        ratio = PA66_DAM.youngs_modulus.nominal / PA66_RH50.youngs_modulus.nominal
-        assert 1.8 < ratio < 3.0
-
-    def test_yield_strength_falls_with_moisture(self):
-        assert PA66_DAM.yield_strength.nominal > PA66_RH50.yield_strength.nominal
-        assert PA66_RH50.yield_strength.nominal > PA66_SATURATED.yield_strength.nominal
-
-    def test_poisson_ratio_rises_with_moisture(self):
-        assert PA66_DAM.poisson_ratio.nominal < PA66_SATURATED.poisson_ratio.nominal
-
-    def test_moisture_contents_are_ordered(self):
-        assert PA66_DAM.moisture_content == 0.0
-        assert PA66_DAM.moisture_content < PA66_RH50.moisture_content
-        assert PA66_RH50.moisture_content < PA66_SATURATED.moisture_content
-
-
-class TestInterpolation:
-    @pytest.mark.parametrize("grade", PA66_CONDITIONS)
-    def test_knots_reproduce_their_grade_exactly(self, grade):
-        e, nu, sy, su = pa66_at_moisture(grade.moisture_content)
-        assert e == pytest.approx(grade.youngs_modulus.nominal)
-        assert nu == pytest.approx(grade.poisson_ratio.nominal)
-        assert sy == pytest.approx(grade.yield_strength.nominal)
-        assert su == pytest.approx(grade.tensile_strength.nominal)
-
-    def test_interpolates_between_knots(self):
-        mid = 0.5 * (PA66_DAM.moisture_content + PA66_RH50.moisture_content)
-        e, _, _, _ = pa66_at_moisture(mid)
-        assert PA66_RH50.youngs_modulus.nominal < e < PA66_DAM.youngs_modulus.nominal
-
-    def test_clamps_above_saturation_rather_than_extrapolating(self):
-        """Linear extrapolation would reach a negative modulus soon enough."""
-        assert pa66_at_moisture(0.5)[0] == pytest.approx(
-            PA66_SATURATED.youngs_modulus.nominal
-        )
-
-    def test_clamps_at_zero(self):
-        assert pa66_at_moisture(0.0)[0] == pytest.approx(
-            PA66_DAM.youngs_modulus.nominal
-        )
-
-    def test_modulus_is_monotone_decreasing(self):
-        c = np.linspace(0.0, 0.12, 50)
-        e = pa66_properties(c)[0]
-        assert np.all(np.diff(e) <= 1e-9)
-
-    def test_corner_selection_changes_the_answer(self):
-        low = pa66_at_moisture(0.025, corner="low")[0]
-        high = pa66_at_moisture(0.025, corner="high")[0]
-        assert low < high
-
-    def test_negative_moisture_is_rejected(self):
-        with pytest.raises(ValueError, match="cannot be negative"):
-            pa66_at_moisture(-0.01)
-
-    def test_roundoff_below_zero_is_tolerated(self):
-        """A field dried fully out interpolates a few ulp below zero.
-
-        Rejecting that outright would make the desorption case unrunnable, so
-        round-off is clamped while a genuinely negative value still raises.
-        """
-        assert pa66_properties(np.array([-1e-18, -1e-12, 0.0]))[0] == pytest.approx(
-            PA66_DAM.youngs_modulus.nominal
-        )
-
-    def test_the_roundoff_tolerance_cannot_mask_a_real_error(self):
-        with pytest.raises(ValueError, match="cannot be negative"):
-            pa66_properties(np.array([0.0, -1e-6]))
-
-    def test_vectorised_matches_scalar(self):
-        c = np.array([0.0, 0.012, 0.025, 0.06, 0.085, 0.3])
-        arrays = pa66_properties(c)
-        for i, ci in enumerate(c):
-            scalar = pa66_at_moisture(float(ci))
-            for j in range(4):
-                assert arrays[j][i] == pytest.approx(scalar[j])
-
-    def test_vectorised_preserves_shape(self):
-        c = np.zeros((3, 7))
-        for arr in pa66_properties(c):
-            assert arr.shape == (3, 7)
 
 
 class TestSteel:
@@ -183,3 +78,60 @@ class TestProvenance:
         assert len(labels) == len(PA66_CONDITIONS)
         for grade in PA66_CONDITIONS:
             assert grade.condition.value in grade.doc_label
+
+
+class TestFractureToughness:
+    def test_conversion_factor_is_root_one_thousand(self):
+        """K has dimensions stress * sqrt(length), so m -> mm multiplies by
+        sqrt(1000). Getting this wrong scales every margin by 31.6."""
+        assert MPA_ROOT_M_TO_MPA_ROOT_MM == pytest.approx(math.sqrt(1000.0))
+        assert MPA_ROOT_M_TO_MPA_ROOT_MM == pytest.approx(31.6228, abs=1e-3)
+
+    def test_conversion_applies_the_factor(self):
+        grade = PA66_RH50
+        assert fracture_toughness_mpa_root_mm(grade, "low") == pytest.approx(
+            grade.fracture_toughness.low * MPA_ROOT_M_TO_MPA_ROOT_MM
+        )
+
+    def test_brackets_are_quoted_in_datasheet_units(self):
+        """Stored in MPa*sqrt(m) so they can be read against a datasheet."""
+        for grade in PA66_CONDITIONS:
+            assert 1.0 < grade.fracture_toughness.low < 20.0
+            assert grade.fracture_toughness.source.units == "MPa*sqrt(m)"
+
+    def test_toughness_rises_with_conditioning(self):
+        """Water plasticises PA66: tougher even as it gets weaker.
+
+        The opposite direction to strength, so a single 'worst case' material
+        does not exist -- dry is worst for fracture, wet is worst for yield.
+        """
+        assert (
+            PA66_DAM.fracture_toughness.nominal
+            < PA66_RH50.fracture_toughness.nominal
+            < PA66_SATURATED.fracture_toughness.nominal
+        )
+
+    def test_strength_falls_as_toughness_rises(self):
+        assert PA66_DAM.yield_strength.nominal > PA66_SATURATED.yield_strength.nominal
+        assert PA66_DAM.fracture_toughness.nominal < PA66_SATURATED.fracture_toughness.nominal
+
+    def test_dry_is_the_conservative_corner_for_fracture(self):
+        assert min(
+            g.fracture_toughness.low for g in PA66_CONDITIONS
+        ) == PA66_DAM.fracture_toughness.low
+
+
+class TestGradeSelection:
+    def test_service_condition_is_conditioned(self):
+        assert SERVICE_CONDITION is MoistureCondition.RH50
+
+    def test_grade_for_returns_the_matching_set(self):
+        for grade in PA66_CONDITIONS:
+            assert grade_for(grade.condition) is grade
+
+    def test_grade_for_defaults_to_the_service_state(self):
+        assert grade_for() is PA66_RH50
+
+    def test_unknown_condition_is_rejected(self):
+        with pytest.raises(ValueError, match="no PA66 properties"):
+            grade_for("underwater")
